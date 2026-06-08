@@ -188,6 +188,24 @@ export async function getQuoteSummary(
 }
 
 /**
+ * Resolve an end-date string into yahoo-finance2's `period2`.
+ *
+ * `new Date("2026-06-08")` parses a plain YYYY-MM-DD as UTC midnight, and
+ * yahoo-finance2 treats period2 as an EXCLUSIVE upper bound — so a bare
+ * end-of-"today" would drop today's daily bar (timestamped during the session,
+ * after 00:00 UTC) and every same-day intraday bar. For a date-only input we
+ * advance to the next day's midnight so the requested end day is fully included.
+ * Inputs that already carry a time component are passed through untouched.
+ */
+function endDateToPeriod2(endDate: string): Date {
+  const d = new Date(endDate)
+  if (/^\d{4}-\d{2}-\d{2}$/.test(endDate)) {
+    d.setUTCDate(d.getUTCDate() + 1)
+  }
+  return d
+}
+
+/**
  * Fetch historical chart data from Yahoo Finance.
  * Uses yahoo-finance2's chart method which handles authentication.
  * Maps to: yf.download() pattern.
@@ -208,7 +226,7 @@ export async function getHistoricalData(
     : new Date(Date.now() - 365 * 24 * 60 * 60 * 1000)
 
   const period2 = options.endDate
-    ? new Date(options.endDate)
+    ? endDateToPeriod2(options.endDate)
     : new Date()
 
   const chartResult = await withRetry(() => yf.chart(symbol, {

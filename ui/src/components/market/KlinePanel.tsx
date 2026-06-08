@@ -48,10 +48,33 @@ function startDateFromToday(days: number): string {
   return d.toISOString().slice(0, 10)
 }
 
-function toUTCTimestamp(s: string): UTCTimestamp {
-  // Daily bars use `YYYY-MM-DD`; intraday uses `YYYY-MM-DD HH:MM:SS`.
-  const iso = s.includes(' ') ? s.replace(' ', 'T') + 'Z' : `${s}T00:00:00Z`
-  return Math.floor(new Date(iso).getTime() / 1000) as UTCTimestamp
+export function toUTCTimestamp(s: string): UTCTimestamp {
+  // Daily bars use `YYYY-MM-DD`; intraday uses `YYYY-MM-DD HH:MM:SS` (UTC).
+  //
+  // lightweight-charts always renders a UTCTimestamp as UTC, so to show the
+  // viewer's local wall-clock time on the axis we bake the local offset into
+  // the value (the library's FAQ-recommended approach). Only intraday bars are
+  // shifted — daily bars stay at calendar-date midnight so the day label never
+  // drifts a day in non-UTC timezones.
+  if (s.includes(' ')) {
+    const utcMs = new Date(s.replace(' ', 'T') + 'Z').getTime()
+    // getTimezoneOffset is UTC-minus-local in minutes (Taipei → -480), so
+    // subtracting it advances the value into local wall-clock time. Computed
+    // per-bar so DST-observing timezones get the right offset for each bar.
+    const localMs = utcMs - new Date(utcMs).getTimezoneOffset() * 60_000
+    return Math.floor(localMs / 1000) as UTCTimestamp
+  }
+  return Math.floor(new Date(`${s}T00:00:00Z`).getTime() / 1000) as UTCTimestamp
+}
+
+// Format a backend bar timestamp for the header range label. Daily bars are
+// plain `YYYY-MM-DD` dates (shown as-is); intraday bars are UTC and are rendered
+// in the viewer's local wall-clock time, mirroring the chart axis.
+export function formatBarDate(s: string): string {
+  if (!s.includes(' ')) return s
+  const d = new Date(s.replace(' ', 'T') + 'Z')
+  const p = (n: number) => String(n).padStart(2, '0')
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
 interface Props {
@@ -234,7 +257,7 @@ export function KlinePanel({ selection }: Props) {
           )}
           {bars && bars.length > 0 && (
             <span className="text-[11px] text-text-muted/60 truncate">
-              {bars.length} bars · {bars[0].date} → {bars[bars.length - 1].date}
+              {bars.length} bars · {formatBarDate(bars[0].date)} → {formatBarDate(bars[bars.length - 1].date)}
             </span>
           )}
         </div>
