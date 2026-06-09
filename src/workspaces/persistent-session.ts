@@ -337,7 +337,7 @@ export class PersistentSession {
     this.wireWs(ws);
     this.startCursorTimer();
 
-    this.log.info('session.attached', {
+    this.log.event('session.attached', {
       since: since ?? null,
       replayFromSeq: slice.effectiveSeq,
       replayBytes: slice.bytes.length,
@@ -355,7 +355,7 @@ export class PersistentSession {
       clearInterval(this.cursorTimer);
       this.cursorTimer = null;
     }
-    this.log.info('session.detached');
+    this.log.event('session.detached');
   }
 
   dispose(reason: string): void {

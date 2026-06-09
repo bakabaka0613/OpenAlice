@@ -3,13 +3,14 @@ name: openalice-cli
 description: >
   How to reach OpenAlice from your shell via the `alice*` CLIs. Two binaries:
   `alice` for MARKET DATA (news, symbol search, equity fundamentals, macro/economy
-  series, technical indicators) and `alice-workspace` for AGENT COLLABORATION
-  (push finished work to the user's inbox, track entities). Both print JSON and
-  are discoverable with `--help`. Use whenever you need a number/headline/
-  fundamental/indicator, or want to hand work back to the user, and this
-  workspace exposes the `alice*` commands instead of (or alongside) the OpenAlice
-  MCP tools: "look up AAPL", "what's Apple's revenue", "search news for the Fed",
-  "compute RSI", "push my findings to the inbox", "track this ticker". Discover
+  series) and `alice-workspace` for AGENT COLLABORATION (push finished work to the
+  user's inbox, track entities). Both print JSON and are discoverable with
+  `--help`. Use whenever you need a number/headline/fundamental, or want to hand
+  work back to the user, and this workspace exposes the `alice*` commands instead
+  of (or alongside) the OpenAlice MCP tools: "look up AAPL", "what's Apple's
+  revenue", "search news for the Fed", "push my findings to the inbox", "track
+  this ticker". (For technical/quantitative analysis on price — RSI, moving
+  averages, multi-timeframe — see the `openalice-quant` skill.) Discover
   everything live with `alice --help` / `alice-workspace --help` — do NOT guess flags.
 ---
 
@@ -64,13 +65,18 @@ alice news grep --pattern "interest rate" --lookback 2d
 alice news read --id <id-from-the-results>
 ```
 
-**Macro / indicators / metadata filters** (`--meta` is repeatable):
+**Macro / metadata filters** (`--meta` is repeatable):
 
 ```bash
 alice economy fred-series --symbol UNRATE --limit 12
-alice analysis indicator --asset equity --formula "RSI(CLOSE('AAPL','1d'),14)"
 alice news grep --pattern BTC --meta source=coindesk --meta category=crypto
 ```
+
+**Technical / quantitative analysis** lives in its own surface — `alice analysis
+search-bars` (find a K-line barId) then `alice analysis quant` (compute). It's a
+small scripting language with a full function catalog, multi-timeframe panels,
+and source selection. **See the `openalice-quant` skill** for the manual; don't
+hand-roll indicators here.
 
 ## Collaboration — `alice-workspace`
 

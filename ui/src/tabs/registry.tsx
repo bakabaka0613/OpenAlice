@@ -68,7 +68,6 @@ const automationSectionTitle: Record<
   string
 > = {
   flow: 'Flow',
-  heartbeat: 'Heartbeat',
   cron: 'Cron Jobs',
   webhook: 'Webhook',
   runs: 'Runs',
@@ -106,7 +105,8 @@ const marketDetailModule: ViewModule<'market-detail'> = {
   kind: 'market-detail',
   title: (spec) => `${spec.params.symbol}`,
   toUrl: (spec) =>
-    `/market/${spec.params.assetClass}/${encodeURIComponent(spec.params.symbol)}`,
+    `/market/${spec.params.assetClass}/${encodeURIComponent(spec.params.symbol)}` +
+    (spec.params.source ? `?source=${encodeURIComponent(spec.params.source)}` : ''),
   Component: MarketDetailPage,
 }
 

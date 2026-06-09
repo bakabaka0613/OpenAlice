@@ -65,6 +65,8 @@ export class UTAManager {
     const savedState = await loadGitState(cfg.id)
     const uta = new UnifiedTradingAccount(broker, {
       guards: cfg.guards,
+      keyless: cfg.keyless,
+      readOnly: cfg.readOnly,
       savedState,
       onCommit: createGitPersister(cfg.id),
       onHealthChange: (utaId, health) => {
@@ -201,7 +203,9 @@ export class UTAManager {
 
   async getAggregatedEquity(): Promise<AggregatedEquity> {
     const results = await Promise.all(
-      Array.from(this.entries.values()).map(async (uta) => {
+      // Keyless (public-data-only) UTAs have no account — skip them so they
+      // don't add a phantom $0 account to the aggregate.
+      Array.from(this.entries.values()).filter((uta) => !uta.keyless).map(async (uta) => {
         if (uta.health !== 'healthy') {
           uta.nudgeRecovery()
           return { id: uta.id, label: uta.label, health: uta.health, info: null }

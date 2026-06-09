@@ -173,12 +173,84 @@ export interface MarketClock {
   timestamp?: Date
 }
 
+/**
+ * Normalized bar interval — Alice-facing enum. Each broker maps this to its
+ * native bar-size / period / timeframe string. Keep this list small and
+ * additive; brokers declare which subset they support via
+ * `AccountCapabilities.historicalBars.supportedBarSizes`.
+ */
+export type BarInterval = '1m' | '5m' | '15m' | '30m' | '1h' | '4h' | '1d' | '1w'
+
+/**
+ * What price stream the bars represent. Mirrors IBKR `whatToShow`; other
+ * brokers only support TRADES (the default) and ignore non-TRADES values.
+ */
+export type BarWhatToShow = 'TRADES' | 'MIDPOINT' | 'BID' | 'ASK'
+
+export interface BarParams {
+  /** Normalized interval; the broker maps it to its native bar size. */
+  interval: BarInterval
+  /** Inclusive lower bound. If omitted, the broker derives a window from `limit`. */
+  start?: Date
+  /** Inclusive upper bound (default: now). */
+  end?: Date
+  /** Max number of bars to return (most-recent-first truncation by the broker). */
+  limit?: number
+  /** Price-stream selector — only IBKR honors non-TRADES values; others ignore. */
+  whatToShow?: BarWhatToShow
+}
+
+/**
+ * One OHLCV bar. Monetary fields are strings — the trading side keeps
+ * Decimal-as-string end-to-end (same convention as `Quote`/`Position`). The
+ * read-only analysis surface (`domain/market-data`) converts to number at its
+ * own boundary.
+ */
+export interface Bar {
+  /** Bar open time (UTC). */
+  timestamp: Date
+  open: string
+  high: string
+  low: string
+  close: string
+  /** Base-asset volume for the bar. */
+  volume: string
+}
+
 // ==================== Broker health ====================
 
 export type BrokerHealth = 'healthy' | 'degraded' | 'offline'
 
+/**
+ * Operational reach — the capability ladder a UTA can currently climb. Health
+ * is NOT a single "connected?" boolean: connecting, reading account data, and
+ * writing orders are three different things.
+ *   - 'down'      transport unreachable (can't load markets / open the socket)
+ *   - 'connected' broker reachable + PUBLIC market data available (no key) —
+ *                 this is full health for a keyless data source
+ *   - 'readable'  PRIVATE account read works (auth OK); implies connected
+ * Writing is not a reach level (we never place a probe order) — it's
+ * `tier === 'trading'`, gated at order time.
+ */
+export type UTAReach = 'down' | 'connected' | 'readable'
+
+/**
+ * What an account is FOR (static, from config) — drives the target reach the
+ * recovery loop aims at, and the UI badge:
+ *   - 'data'    keyless public-data source        → target reach 'connected'
+ *   - 'account' funded but read-only              → target reach 'readable'
+ *   - 'trading' funded + writable                 → target reach 'readable'
+ */
+export type UTATier = 'data' | 'account' | 'trading'
+
 export interface BrokerHealthInfo {
   status: BrokerHealth
+  /** Current operational reach on the capability ladder. */
+  reach: UTAReach
+  /** What this account is for (static). Recovery aims for this account's target
+   *  reach — a keyless 'data' account is healthy at 'connected', and never
+   *  probes account-read, so it no longer loops on "requires apiKey". */
+  tier: UTATier
   consecutiveFailures: number
   lastError?: string
   lastSuccessAt?: Date
@@ -189,9 +261,26 @@ export interface BrokerHealthInfo {
 
 // ==================== Account capabilities ====================
 
+/**
+ * Historical-bar capability, carrying entitlement/quality semantics rather
+ * than a bare boolean:
+ *   - 'realtime'     full-quality exchange data (CCXT free public OHLCV)
+ *   - 'iex'          IEX-only feed, partial tape (Alpaca free tier)
+ *   - 'delayed'      15-min delayed (IBKR without a market-data subscription)
+ *   - 'subscription' full data, gated on an active subscription
+ */
+export interface HistoricalBarsCapability {
+  supported: boolean
+  quality?: 'realtime' | 'iex' | 'delayed' | 'subscription'
+  /** Subset of BarInterval this broker actually maps to a native bar size. */
+  supportedBarSizes?: BarInterval[]
+}
+
 export interface AccountCapabilities {
   supportedSecTypes: string[]
   supportedOrderTypes: string[]
+  /** Absent ⇒ no historical-bar support (loud-refuse on getHistorical). */
+  historicalBars?: HistoricalBarsCapability
 }
 
 // ==================== Broker config field descriptor ====================
@@ -265,6 +354,25 @@ export interface IBroker<TMeta = unknown> {
   getOrder(orderId: string): Promise<OpenOrder | null>
   getQuote(contract: Contract): Promise<Quote>
   getMarketClock(): Promise<MarketClock>
+
+  /**
+   * Historical OHLCV bars. Optional — brokers without time-series data
+   * (e.g. LeverUp/Pyth) leave it undefined and declare no `historicalBars`
+   * capability; `UnifiedTradingAccount.getHistorical` loud-refuses with a
+   * `BrokerError('CONFIG', ...)` rather than silently returning `[]`. Each
+   * implementation maps `BarParams.interval` to its native bar size.
+   */
+  getHistorical?(contract: Contract, params: BarParams): Promise<Bar[]>
+
+  /**
+   * The asset class a contract belongs to, decided by the VENUE — not by the
+   * instrument's claimed type. A crypto exchange's "AAPL" is a synthetic /
+   * custodial token, so CcxtBroker reports everything as 'crypto' regardless of
+   * secType; IBKR/Alpaca map per real instrument. Optional — when absent, the
+   * consumer falls back to a secType heuristic (which is broker-blind and wrong
+   * for e.g. a CCXT dated future, hence this hook).
+   */
+  assetClassFor?(contract: Contract): 'equity' | 'crypto' | 'currency' | 'commodity' | 'unknown'
 
   // ---- Capabilities ----
 

@@ -22,6 +22,31 @@ function getStagedPlaceOrder(uta: UnifiedTradingAccount) {
   return { contract: op.contract, order: op.order }
 }
 
+// ==================== Read-only / keyless write guard ====================
+
+describe('UTA — read-only / keyless write guard', () => {
+  it('refuses stage operations on a read-only account', () => {
+    const { uta } = createUTA(undefined, { readOnly: true })
+    expect(uta.readOnly).toBe(true)
+    expect(uta.keyless).toBe(false)
+    expect(() => uta.stageCancelOrder({ orderId: 'x' })).toThrow(/read-only/)
+    expect(() => uta.stagePlaceOrder({ aliceId: 'mock-paper|AAPL', action: 'BUY', orderType: 'MKT', totalQuantity: 1 } as never)).toThrow(/read-only/)
+  })
+
+  it('keyless implies read-only and names keyless in the error', () => {
+    const { uta } = createUTA(undefined, { keyless: true })
+    expect(uta.keyless).toBe(true)
+    expect(uta.readOnly).toBe(true)
+    expect(() => uta.stageCancelOrder({ orderId: 'x' })).toThrow(/keyless/)
+  })
+
+  it('a normal account stages without complaint', () => {
+    const { uta } = createUTA()
+    expect(uta.readOnly).toBe(false)
+    expect(() => uta.stageCancelOrder({ orderId: 'x' })).not.toThrow()
+  })
+})
+
 // ==================== Operation dispatch (via push) ====================
 
 describe('UTA — operation dispatch', () => {
@@ -801,6 +826,43 @@ describe('UTA — health tracking', () => {
     // Success on a different method resets
     await uta.getMarketClock()
     expect(uta.health).toBe('healthy')
+  })
+
+  // ---- capability ladder (connect / read / write are different things) ----
+
+  it('keyless data account is healthy at "connected" and never probes getAccount', async () => {
+    const broker = new MockBroker()
+    broker.setFailMethod('getAccount') // would throw "requires apiKey" if the probe touched it
+    const { uta } = createUTA(broker, { keyless: true })
+    await flush()
+
+    expect(uta.health).toBe('healthy')
+    expect(uta.getHealthInfo().reach).toBe('connected')
+    expect(uta.getHealthInfo().tier).toBe('data')
+    expect(broker.callCount('getAccount')).toBe(0) // the fix: probe stops at L1
+  })
+
+  it('funded account with failing account-read is degraded (connected), not offline, and recovers', async () => {
+    const broker = new MockBroker()
+    broker.setFailMethod('getAccount')
+    const { uta } = createUTA(broker) // funded → target "readable"
+    await flush()
+
+    expect(uta.getHealthInfo().reach).toBe('connected') // transport up...
+    expect(uta.health).toBe('degraded')                 // ...but below target — NOT a full outage
+    expect(uta.getHealthInfo().recovering).toBe(true)
+
+    broker.clearFailMethod('getAccount') // account-read comes back
+    await vi.advanceTimersByTimeAsync(5_000)
+    expect(uta.getHealthInfo().reach).toBe('readable')
+    expect(uta.health).toBe('healthy')
+    await uta.close()
+  })
+
+  it('reports tier: data (keyless) / account (read-only) / trading (writable)', () => {
+    expect(createUTA(new MockBroker(), { keyless: true }).uta.getHealthInfo().tier).toBe('data')
+    expect(createUTA(new MockBroker(), { readOnly: true }).uta.getHealthInfo().tier).toBe('account')
+    expect(createUTA(new MockBroker()).uta.getHealthInfo().tier).toBe('trading')
   })
 })
 

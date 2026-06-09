@@ -132,7 +132,7 @@ export function attachWorkspacesWS(httpServer: HttpServer, svc: WorkspaceService
       try { ws.close(4404, 'session not found'); } catch { /* ignore */ }
       return;
     }
-    launcherLogger.info('upgrade.accepted', {
+    launcherLogger.event('upgrade.accepted', {
       sessionId,
       wsId: session.wsId,
       cols,

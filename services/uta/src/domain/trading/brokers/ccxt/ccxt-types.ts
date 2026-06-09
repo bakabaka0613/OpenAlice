@@ -2,6 +2,8 @@ export interface CcxtBrokerConfig {
   id?: string
   label?: string
   exchange: string
+  /** Public-data-only — skip credential validation in init() (no key needed). */
+  keyless?: boolean
   sandbox: boolean
   demoTrading?: boolean
   options?: Record<string, unknown>

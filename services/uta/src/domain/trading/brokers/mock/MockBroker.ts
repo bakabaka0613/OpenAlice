@@ -29,6 +29,8 @@ import type {
   Quote,
   MarketClock,
   TpSlParams,
+  Bar,
+  BarParams,
 } from '../types.js'
 import '../../contract-ext.js'
 import { derivePositionMath, aggregateAccountFromPositions } from '../../position-math.js'
@@ -97,6 +99,7 @@ export const DEFAULT_ACCOUNT_INFO: AccountInfo = {
 export const DEFAULT_CAPABILITIES: AccountCapabilities = {
   supportedSecTypes: ['STK', 'CRYPTO'],
   supportedOrderTypes: ['MKT', 'LMT', 'STP', 'STP LMT'],
+  historicalBars: { supported: true, quality: 'realtime' },
 }
 
 // ==================== Factory helpers ====================
@@ -191,6 +194,7 @@ export class MockBroker implements IBroker {
   private _accountOverride: AccountInfo | null = null
   private _callLog: CallRecord[] = []
   private _failRemaining = 0
+  private _failMethods = new Set<string>()
 
   constructor(options: MockBrokerOptions = {}) {
     this.id = options.id ?? 'mock-paper'
@@ -211,6 +215,9 @@ export class MockBroker implements IBroker {
   }
 
   private _checkFail(method: string): void {
+    if (this._failMethods.has(method)) {
+      throw new Error(`MockBroker[${this.id}]: simulated ${method} failure`)
+    }
     if (this._failRemaining > 0) {
       this._failRemaining--
       throw new Error(`MockBroker[${this.id}]: simulated ${method} failure`)
@@ -450,6 +457,28 @@ export class MockBroker implements IBroker {
       volume: '1000000',
       timestamp: new Date(),
     }
+  }
+
+  async getHistorical(contract: Contract, params: BarParams): Promise<Bar[]> {
+    this._record('getHistorical', [contract, params])
+    const base = (this._markPriceFor(contract) ?? new Decimal(100)).toNumber()
+    const n = params.limit ?? 30
+    const end = params.end ?? new Date()
+    const dayMs = 86_400_000
+    const bars: Bar[] = []
+    // Deterministic gentle up-drift so tests can assert ordering + monotonicity.
+    for (let i = n - 1; i >= 0; i--) {
+      const close = base + (n - 1 - i) * 0.1
+      bars.push({
+        timestamp: new Date(end.getTime() - i * dayMs),
+        open: String(close - 0.5),
+        high: String(close + 1),
+        low: String(close - 1),
+        close: String(close),
+        volume: '1000',
+      })
+    }
+    return bars
   }
 
   async getMarketClock(): Promise<MarketClock> {
@@ -823,6 +852,15 @@ export class MockBroker implements IBroker {
   /** Make the next N broker calls throw. Used to test health transitions. */
   setFailMode(count: number): void {
     this._failRemaining = count
+  }
+
+  /** Make a specific method always throw (until cleared) — lets a test fail
+   *  e.g. getAccount while letting init succeed (the capability-ladder case). */
+  setFailMethod(method: string): void {
+    this._failMethods.add(method)
+  }
+  clearFailMethod(method: string): void {
+    this._failMethods.delete(method)
   }
 
   /** Override account info directly. Bypasses computed values from positions. */

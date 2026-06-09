@@ -12,7 +12,7 @@
 
 import { Hono } from 'hono'
 import { serve } from '@hono/node-server'
-import { loadConfig, readUTAsConfig, purgeEphemeralUTAs } from '@/core/config.js'
+import { loadConfig, readUTAsConfig, purgeEphemeralUTAs, type UTAConfig } from '@/core/config.js'
 import { createEventLog } from '@/core/event-log.js'
 import { ToolCenter } from '@/core/tool-center.js'
 import {
@@ -54,9 +54,36 @@ async function main(): Promise<void> {
   // ==================== Account init (with ephemeral purge) ====================
 
   const survivors = await purgeEphemeralUTAs(await readUTAsConfig())
-  for (const accCfg of survivors) {
+  // Built-in keyless read-only data UTAs (binance/okx/bybit) — code-defined, not
+  // persisted to accounts.json, so they can't be edited/clobbered. They serve
+  // public crypto K-lines out-of-box (no API key) and are redundant sources for
+  // the federated bar layer. A user's own exchange UTA uses a different id.
+  const userIds = new Set(survivors.map((u) => u.id))
+  const dataUTAs: UTAConfig[] = ['binance', 'okx', 'bybit']
+    .filter((ex) => !userIds.has(`${ex}-readonly`))
+    .map((ex) => ({
+      id: `${ex}-readonly`,
+      label: `${ex[0].toUpperCase()}${ex.slice(1)} (read-only data)`,
+      presetId: 'ccxt-custom',
+      enabled: true,
+      guards: [],
+      presetConfig: { exchange: ex },
+      keyless: true,
+      readOnly: true,
+      editable: false,
+    }))
+
+  for (const accCfg of [...dataUTAs, ...survivors]) {
     if (accCfg.enabled === false) continue
-    await utaManager.initUTA(accCfg)
+    // One account's init must never abort the whole bootstrap (broker
+    // construction is sync; the connection is async + health-tracked, so this
+    // only guards genuinely-broken config — but a built-in data UTA throwing
+    // would otherwise take the user's real UTAs down with it).
+    try {
+      await utaManager.initUTA(accCfg)
+    } catch (err) {
+      console.warn(`[uta] failed to init "${accCfg.id}": ${err instanceof Error ? err.message : String(err)}`)
+    }
   }
   utaManager.registerCcxtToolsIfNeeded()
 

@@ -23,6 +23,8 @@ import {
   type MarketClock,
   type BrokerConfigField,
   type TpSlParams,
+  type Bar,
+  type BarParams,
 } from '../types.js'
 import '../../contract-ext.js'
 import { aggregateAccountFromPositions } from '../../position-math.js'
@@ -35,6 +37,7 @@ import {
   makeOrderState,
   marketToContract,
   contractToCcxt,
+  CCXT_TIMEFRAME,
 } from './ccxt-contracts.js'
 import { fuzzyRankContracts } from '../fuzzy-rank.js'
 import {
@@ -121,6 +124,8 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
     return new CcxtBroker({
       id: config.id,
       label: config.label,
+      // configSchema strips unknown keys, so read keyless off the raw dict.
+      keyless: config.brokerConfig.keyless === true,
       exchange: bc.exchange,
       sandbox: bc.sandbox,
       demoTrading: bc.demoTrading,
@@ -147,6 +152,8 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
 
   private exchange: Exchange
   private exchangeName: string
+  /** Public-data-only mode — skip credential validation in init(). */
+  private keyless: boolean
   private initialized = false
   private overrides: CcxtExchangeOverrides
   // orderId → ccxtSymbol cache (CCXT needs symbol to cancel)
@@ -154,6 +161,7 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
 
   constructor(config: CcxtBrokerConfig) {
     this.exchangeName = config.exchange
+    this.keyless = config.keyless ?? false
     this.meta = { exchange: config.exchange }
     this.overrides = exchangeOverrides[config.exchange] ?? {}
     this.id = config.id ?? `${config.exchange}-main`
@@ -202,9 +210,11 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
   // ---- Lifecycle ----
 
   async init(): Promise<void> {
-    // Validate credentials per the exchange's own requiredCredentials map.
+    // Keyless (public-data-only) accounts skip credential validation — they
+    // only ever call public endpoints (loadMarkets / fetchOHLCV / fetchTicker).
+    // Validate credentials per the exchange's own requiredCredentials map otherwise.
     // Hyperliquid needs walletAddress + privateKey; OKX needs apiKey + secret + password; etc.
-    try {
+    if (!this.keyless) try {
       this.exchange.checkRequiredCredentials()
     } catch (err) {
       const required = Object.entries(this.exchange.requiredCredentials ?? {})
@@ -670,6 +680,12 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
   }
 
   async getAccount(): Promise<AccountInfo> {
+    // Keyless data sources have no account — return a zeroed one rather than
+    // calling fetchBalance (which requires credentials). The federation excludes
+    // keyless UTAs from equity aggregation, so this never shows as phantom cash.
+    if (this.keyless) {
+      return { baseCurrency: 'USD', netLiquidation: '0', totalCashValue: '0', unrealizedPnL: '0', realizedPnL: '0', initMarginReq: '0' }
+    }
     this.ensureInit()
 
     try {
@@ -737,6 +753,7 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
   }
 
   async getPositions(): Promise<Position[]> {
+    if (this.keyless) return []
     this.ensureInit()
 
     try {
@@ -792,6 +809,7 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
   }
 
   async getOrders(orderIds: string[]): Promise<OpenOrder[]> {
+    if (this.keyless) return []
     this.ensureInit()
 
 
@@ -881,12 +899,47 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
     }
   }
 
+  /**
+   * Historical OHLCV via ccxt `fetchOHLCV`. Free public endpoint on most
+   * exchanges (realtime quality, no entitlement tier). Validates the interval
+   * against the exchange's actual `timeframes` and loud-refuses if unsupported.
+   */
+  async getHistorical(contract: Contract, params: BarParams): Promise<Bar[]> {
+    this.ensureInit()
+    const ccxtSymbol = contractToCcxt(contract, this.markets, this.exchangeName)
+    if (!ccxtSymbol) throw new BrokerError('EXCHANGE', 'Cannot resolve contract to CCXT symbol')
+    const timeframe = CCXT_TIMEFRAME[params.interval]
+    const supported = this.exchange.timeframes as Record<string, unknown> | undefined
+    if (supported && !(timeframe in supported)) {
+      throw new BrokerError('EXCHANGE', `${this.exchangeName} does not support the ${params.interval} interval`)
+    }
+    try {
+      const since = params.start ? params.start.getTime() : undefined
+      const rows = await this.exchange.fetchOHLCV(ccxtSymbol, timeframe, since, params.limit)
+      return (rows as number[][]).map(([ts, o, h, l, c, v]) => ({
+        timestamp: new Date(ts),
+        open: String(o), high: String(h), low: String(l), close: String(c),
+        volume: String(v ?? 0),
+      }))
+    } catch (err) {
+      throw BrokerError.from(err)
+    }
+  }
+
   // ---- Capabilities ----
+
+  /** A crypto exchange's instruments are crypto — period. Even a listed "AAPL"
+   *  is a synthetic/custodial token here, not the real equity; secType (spot /
+   *  CRYPTO_PERP / FUT / OPT) is the instrument shape, not the asset class. */
+  assetClassFor(): 'crypto' {
+    return 'crypto'
+  }
 
   getCapabilities(): AccountCapabilities {
     return {
       supportedSecTypes: ['CRYPTO', 'CRYPTO_PERP'],
       supportedOrderTypes: ['MKT', 'LMT'],
+      historicalBars: { supported: true, quality: 'realtime' },
     }
   }
 

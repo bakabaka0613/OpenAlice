@@ -1,5 +1,5 @@
 import { useEffect } from 'react'
-import { Navigate, Route, Routes, useParams } from 'react-router-dom'
+import { Navigate, Route, Routes, useParams, useSearchParams } from 'react-router-dom'
 import { useWorkspace } from './store'
 import { specEquals, type ActivitySection, type ViewSpec } from './types'
 import { getView } from './registry'
@@ -84,7 +84,6 @@ export function UrlAdopter() {
         <Route path="/logs" element={<Navigate to="/dev/logs" replace />} />
         <Route path="/events" element={<Navigate to="/dev/logs" replace />} />
         <Route path="/agent-status" element={<Navigate to="/dev/logs" replace />} />
-        <Route path="/heartbeat" element={<Navigate to="/automation/heartbeat" replace />} />
         <Route path="/scheduler" element={<Navigate to="/automation/cron" replace />} />
         <Route path="/ai-provider" element={<Navigate to="/settings/ai-provider" replace />} />
         <Route path="/trading" element={<Navigate to="/settings/trading" replace />} />
@@ -115,10 +114,12 @@ function AdoptStatic({ spec }: { spec: ViewSpec }) {
 
 function AdoptMarketDetail() {
   const { assetClass, symbol } = useParams<{ assetClass: string; symbol: string }>()
+  const [search] = useSearchParams()
   const valid: ReadonlyArray<string> = ['equity', 'crypto', 'currency', 'commodity']
   if (!assetClass || !symbol || !valid.includes(assetClass)) {
     return <Navigate to="/market" replace />
   }
+  const source = search.get('source') ?? undefined
   return (
     <AdoptStatic
       spec={{
@@ -126,6 +127,7 @@ function AdoptMarketDetail() {
         params: {
           assetClass: assetClass as Extract<ViewSpec, { kind: 'market-detail' }>['params']['assetClass'],
           symbol,
+          ...(source ? { source } : {}),
         },
       }}
     />
@@ -154,7 +156,7 @@ function AdoptDev() {
 
 function AdoptAutomation() {
   const { section } = useParams<{ section: string }>()
-  const valid: ReadonlyArray<string> = ['flow', 'heartbeat', 'cron', 'webhook']
+  const valid: ReadonlyArray<string> = ['flow', 'cron', 'webhook']
   if (!section || !valid.includes(section)) return <Navigate to="/automation/flow" replace />
   return (
     <AdoptStatic

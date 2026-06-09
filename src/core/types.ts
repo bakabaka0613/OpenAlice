@@ -3,10 +3,9 @@ import type { UTAManagerSDK } from '../services/uta-client/index.js'
 import type { INewsProvider } from '../domain/news/types.js'
 import type { MarketSearchDeps } from '../domain/market-data/aggregate-search.js'
 import type { EquityClientLike } from '../domain/market-data/client/types.js'
+import type { BarService } from '../domain/market-data/bars/index.js'
 import type { CronEngine } from '../task/cron/engine.js'
-import type { Heartbeat } from '../task/heartbeat/index.js'
 import type { Config, WebChannel } from './config.js'
-import type { GenerateRouter } from './ai-provider-manager.js'
 import type { EventLog } from './event-log.js'
 import type { ToolCallLog } from './tool-call-log.js'
 import type { ToolCenter } from './tool-center.js'
@@ -43,14 +42,8 @@ export interface EngineContext {
    *  workspace agents via the entity_upsert MCP tool; read by the Tracked
    *  tab. Notes point at entities with `[[name]]` links. */
   entityStore: IEntityStore
-  /** Provider router — resolves the active profile to an AIProvider and
-   *  drives one-shot / test calls. The in-process agent loop (formerly
-   *  AgentCenter) is retired; the model loop now runs inside the native
-   *  workspace CLIs, and AgentWork drives this router directly. */
-  router: GenerateRouter
   eventLog: EventLog
   toolCallLog: ToolCallLog
-  heartbeat: Heartbeat
   cronEngine: CronEngine
   toolCenter: ToolCenter
   listenerRegistry: ListenerRegistry
@@ -66,6 +59,10 @@ export interface EngineContext {
   /** Equity market-data client. Shared between the equity/analysis/sector-rotation
    *  AI tools and the /api/market/* HTTP routes (e.g. sector-rotation). */
   equityClient: EquityClientLike
+  /** Federated K-line / bar layer — unifies vendor (OpenTypeBB) + broker (UTA)
+   *  OHLCV behind one barId-keyed interface. Consumed by the analysis tools and
+   *  (Phase 3) the /api/bars chart route. */
+  barService: BarService
 
   // Trading — HTTP-backed SDK that talks to the co-located UTA service.
   // FxService and SnapshotService live entirely inside UTA after Step 6;
