@@ -47,6 +47,7 @@ import {
   defaultCancelOrderById,
   defaultPlaceOrder,
   defaultFetchPositions,
+  defaultFetchAllOpenOrders,
 } from './overrides.js'
 
 // Treated as cash (1:1 to USD) when computing balances and as ineligible
@@ -158,6 +159,7 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
   private overrides: CcxtExchangeOverrides
   // orderId → ccxtSymbol cache (CCXT needs symbol to cancel)
   private orderSymbolCache = new Map<string, string>()
+  private warnedOpenOrdersUnsupported = false
 
   constructor(config: CcxtBrokerConfig) {
     this.exchangeName = config.exchange
@@ -438,6 +440,29 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
       return { success: false, error: 'Either totalQuantity or cashQty must be provided' }
     }
 
+    // Attached TP/SL on CCXT venues: REFUSE until a per-exchange override
+    // has verified the attach actually reaches the venue. Observed live on
+    // okx spot: the unified takeProfit/stopLoss params were accepted by
+    // ccxt, silently dropped at the venue mapping, and the entry filled
+    // UNPROTECTED — the ledger said "long with a stop", the exchange said
+    // "naked long". A missing stop that looks attached is the worst failure
+    // mode a trading system has; loud refusal beats silent downgrade
+    // (same rule as order-type support). Venue-verified attach
+    // implementations land via the overrides registry (fetchAllOpenOrders
+    // pattern) — okx needs attachAlgoOrds, bybit its native v5 fields.
+    if (tpsl?.takeProfit || tpsl?.stopLoss) {
+      const attachOverride = this.overrides.placeOrderWithTpSl
+      if (!attachOverride) {
+        return {
+          success: false,
+          error:
+            `Attached TP/SL is not verified to reach ${this.exchangeName} through ccxt — refusing rather than ` +
+            `risking a silently unprotected position. Place the entry first, then a separate stop/take-profit ` +
+            `order, or use a venue with verified attach support.`,
+        }
+      }
+    }
+
     try {
       const params: Record<string, unknown> = { ...extraParams }
 
@@ -451,17 +476,42 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
         }
       }
 
-      const ccxtOrderType = ibkrOrderTypeToCcxt(order.orderType)
+      // Conditional orders: ccxt's convention is BASE type (market/limit) +
+      // params.triggerPrice — ccxt routes each venue to its algo endpoint.
+      // The old lowercase passthrough sent okx a literal ordType "stp"
+      // (51000 Parameter error, observed live), which meant the documented
+      // "place a separate stop" path didn't work either. TRAIL* stays
+      // refused until venue-verified — same rule as attached TP/SL.
+      let ccxtOrderType = ibkrOrderTypeToCcxt(order.orderType)
+      if (order.orderType === 'STP' || order.orderType === 'STP LMT') {
+        if (order.auxPrice.equals(UNSET_DECIMAL)) {
+          return { success: false, error: `${order.orderType} requires auxPrice (the stop trigger price).` }
+        }
+        params.triggerPrice = order.auxPrice.toNumber()
+        ccxtOrderType = order.orderType === 'STP' ? 'market' : 'limit'
+      } else if (order.orderType === 'TRAIL' || order.orderType === 'TRAIL LIMIT') {
+        return {
+          success: false,
+          error:
+            `${order.orderType} is not verified to reach ${this.exchangeName} through ccxt — refusing rather ` +
+            `than risking a silently mis-typed order. Use STP / STP LMT, or manage the trail manually.`,
+        }
+      }
       const side = order.action.toLowerCase() as 'buy' | 'sell'
       // CCXT SDK expects number for price — convert at the wire boundary.
       const refPrice = ccxtOrderType === 'limit' && !order.lmtPrice.equals(UNSET_DECIMAL)
         ? order.lmtPrice.toNumber()
         : undefined
 
+      const attachOverride = this.overrides.placeOrderWithTpSl
       const placeOverride = this.overrides.placeOrder
-      const ccxtOrder = placeOverride
-        ? await placeOverride(this.exchange, ccxtSymbol, ccxtOrderType, side, parseFloat(size), refPrice, params, defaultPlaceOrder)
-        : await defaultPlaceOrder(this.exchange, ccxtSymbol, ccxtOrderType, side, parseFloat(size), refPrice, params)
+      const ccxtOrder = (tpsl?.takeProfit || tpsl?.stopLoss) && attachOverride
+        // Venue-verified attach path — the gate above guarantees tpsl only
+        // gets this far when the exchange has an override for it.
+        ? await attachOverride(this.exchange, ccxtSymbol, ccxtOrderType, side, parseFloat(size), refPrice, tpsl, params)
+        : placeOverride
+          ? await placeOverride(this.exchange, ccxtSymbol, ccxtOrderType, side, parseFloat(size), refPrice, params, defaultPlaceOrder)
+          : await defaultPlaceOrder(this.exchange, ccxtSymbol, ccxtOrderType, side, parseFloat(size), refPrice, params)
 
       // Cache orderId → symbol
       if (ccxtOrder.id) {
@@ -821,10 +871,13 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
     return results
   }
 
-  async getOrder(orderId: string): Promise<OpenOrder | null> {
+  async getOrder(orderId: string, symbolHint?: string): Promise<OpenOrder | null> {
     this.ensureInit()
 
-    const ccxtSymbol = this.orderSymbolCache.get(orderId)
+    // CCXT order lookup is symbol-scoped. The in-memory cache covers orders
+    // placed by this process; the hint (broker-native localSymbol persisted
+    // with the git operation) covers orders placed before a restart.
+    const ccxtSymbol = this.orderSymbolCache.get(orderId) ?? symbolHint
     if (!ccxtSymbol) return null
 
     const fetchOverride = this.overrides.fetchOrderById
@@ -853,6 +906,9 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
     order.totalQuantity = new Decimal(o.amount ?? 0)
     order.orderType = (o.type ?? 'market').toUpperCase()
     if (o.price != null) order.lmtPrice = new Decimal(o.price)
+    // Fill data — without these, a sync that sees the order filled records
+    // the transition but loses qty/price, breaking cost-basis downstream.
+    if (o.filled != null) order.filledQuantity = new Decimal(o.filled)
     order.orderId = parseInt(o.id, 10) || 0
 
     const tp = o.takeProfitPrice
@@ -868,7 +924,43 @@ export class CcxtBroker implements IBroker<CcxtBrokerMeta> {
       contract,
       order,
       orderState: makeOrderState(o.status),
+      ...(o.id && { orderId: String(o.id) }),
+      ...(o.average != null && { avgFillPrice: String(o.average) }),
       ...(tpsl && { tpsl }),
+    }
+  }
+
+  /**
+   * All open orders on the account — the surface external-order observation
+   * diffs against. Venue-dependent: some exchanges can't enumerate open
+   * orders without a symbol scope; those degrade to [] with a once-per-
+   * instance warning rather than failing the observation pass.
+   */
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    if (this.keyless) return []
+    this.ensureInit()
+    try {
+      const fetchOverride = this.overrides.fetchAllOpenOrders
+      const raw = fetchOverride
+        ? await fetchOverride(this.exchange, defaultFetchAllOpenOrders)
+        : await defaultFetchAllOpenOrders(this.exchange)
+      const converted: OpenOrder[] = []
+      for (const o of raw) {
+        // convertCcxtOrder also seeds the orderId→symbol cache, so an
+        // observed external order is immediately syncable.
+        const open = this.convertCcxtOrder(o)
+        if (open) converted.push(open)
+      }
+      return converted
+    } catch (err) {
+      if (!this.warnedOpenOrdersUnsupported) {
+        this.warnedOpenOrdersUnsupported = true
+        console.warn(
+          `CcxtBroker[${this.id}]: fetchOpenOrders unavailable — external-order observation disabled for this account ` +
+          `(${err instanceof Error ? err.message : String(err)})`,
+        )
+      }
+      return []
     }
   }
 

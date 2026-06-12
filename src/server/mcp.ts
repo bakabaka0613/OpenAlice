@@ -29,7 +29,7 @@ import { registerCliRoutes } from './cli.js'
  *                           the workspace's own .mcp.json.
  *
  *   GET  /cli/:wsId/:export/manifest   Same identity-by-URL trick — the gateway
- *   POST /cli/:wsId/:export/invoke     for the workspace-local `alice*` CLIs
+ *   POST /cli/:wsId/:export/invoke     for the workspace-local CLIs (alice*, traderhub)
  *                              (`:export` = data | workspace; see ./cli.ts).
  *                              Reuses this server's port so the shim needs no
  *                              token.
@@ -149,7 +149,7 @@ export class McpPlugin implements Plugin {
     // This listener carries the full tool surface (trading included) and the
     // CLI gateway with NO authentication: its security model is "only local
     // processes can reach it". Its sole consumers are workspace subprocesses
-    // (native agent CLIs + the `alice*` shims), which run on the same host
+    // (native agent CLIs + the CLI shims), which run on the same host
     // and always dial 127.0.0.1 — so there is no legitimate remote caller to
     // serve. Remote access is the web port's job (47331), which gates on the
     // admin token. Without an explicit hostname @hono/node-server binds the

@@ -4,6 +4,7 @@ import { dirname } from 'path'
 // as of 0.40 — the model loop runs inside the native workspace CLIs; autonomous
 // runs go through headless workspace dispatch (cron → workspace).
 import { loadConfig } from './core/config.js'
+import { printLegacyDataNotice } from './core/legacy-data-notice.js'
 import { dataPath, defaultPath } from '@/core/paths.js'
 import type { Plugin, EngineContext } from './core/types.js'
 import { McpPlugin } from './server/mcp.js'
@@ -27,6 +28,7 @@ import { createQuantTools } from './tool/quant.js'
 import { createBarService } from './domain/market-data/bars/index.js'
 import { createReferenceData } from './domain/market-data/reference/service.js'
 import { createSectorRotationTools } from './tool/sector-rotation.js'
+import { createReferenceBoardTools } from './tool/reference-board.js'
 import { createDerivativesTools } from './tool/derivatives.js'
 import { createIndexTools } from './tool/indices.js'
 import { createEconomyTools } from './tool/economy.js'
@@ -66,6 +68,11 @@ async function readWithDefault(target: string, defaultFile: string): Promise<str
 }
 
 async function main() {
+  // Before migrations create the new config dir: if this checkout carries a
+  // pre-global-root data/ store, tell the user how to adopt it (covers bare
+  // `pnpm start`; guardian children get OPENALICE_HOME so this stays quiet).
+  printLegacyDataNotice('[alice]')
+
   const config = await loadConfig()
 
   // ==================== Event Log ====================
@@ -202,18 +209,19 @@ async function main() {
 
   toolCenter.register(createCronTools(cronEngine), 'cron')
   toolCenter.register(createMarketSearchTools(marketSearch), 'market-search')
+  toolCenter.register(createReferenceBoardTools(reference), 'market-board')
   toolCenter.register(createEquityTools(equityClient), 'equity')
   if (etfClient) {
     toolCenter.register(createEtfTools(etfClient), 'etf')
   }
   if (config.news.enabled) {
-    toolCenter.register(createNewsArchiveTools(newsStore), 'news')
+    toolCenter.register(createNewsArchiveTools(newsStore), 'rss')
   }
   // v1 calculateIndicator (createAnalysisTools) is retired from the tool surface
   // — calculateQuant (v2, barId-keyed) supersedes it and the two descriptions
   // confused the model / bloated context. The code remains for now.
   toolCenter.register(createQuantTools({ barService }), 'quant')
-  toolCenter.register(createSectorRotationTools(equityClient), 'sector-rotation')
+  toolCenter.register(createSectorRotationTools(equityClient, config.marketData.hub), 'sector-rotation')
   if (derivativesClient) {
     toolCenter.register(createDerivativesTools(derivativesClient), 'derivatives')
   }

@@ -75,6 +75,22 @@ function ibkrTifToAlpaca(tif: string): string {
   }
 }
 
+/**
+ * Surface Alpaca's response body in failures. The SDK throws axios-shaped
+ * errors whose message is just "Request failed with status code 422" — the
+ * actual reason ("order is not cancelable", observed live when cancelling
+ * during the after-hours pending_new window) lives in response.data and was
+ * being dropped, leaving the git record and the UI with an opaque code.
+ */
+function alpacaErrorMessage(err: unknown): string {
+  const base = err instanceof Error ? err.message : String(err)
+  const data = (err as { response?: { data?: unknown } })?.response?.data
+  if (data && typeof data === 'object') {
+    return `${base} — alpaca: ${JSON.stringify(data)}`
+  }
+  return base
+}
+
 export class AlpacaBroker implements IBroker {
   // ---- Self-registration ----
 
@@ -299,7 +315,7 @@ export class AlpacaBroker implements IBroker {
         orderState: makeOrderState(result.status),
       }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) }
+      return { success: false, error: alpacaErrorMessage(err) }
     }
   }
 
@@ -320,7 +336,7 @@ export class AlpacaBroker implements IBroker {
         orderState: makeOrderState(result.status),
       }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) }
+      return { success: false, error: alpacaErrorMessage(err) }
     }
   }
 
@@ -331,7 +347,7 @@ export class AlpacaBroker implements IBroker {
       orderState.status = 'Cancelled'
       return { success: true, orderId, orderState }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) }
+      return { success: false, error: alpacaErrorMessage(err) }
     }
   }
 
@@ -365,7 +381,7 @@ export class AlpacaBroker implements IBroker {
         orderState: makeOrderState(result.status),
       }
     } catch (err) {
-      return { success: false, error: err instanceof Error ? err.message : String(err) }
+      return { success: false, error: alpacaErrorMessage(err) }
     }
   }
 
@@ -437,6 +453,16 @@ export class AlpacaBroker implements IBroker {
       return this.mapOpenOrder(raw)
     } catch {
       return null
+    }
+  }
+
+  /** All open orders on the account — external-order observation surface. */
+  async getOpenOrders(): Promise<OpenOrder[]> {
+    try {
+      const raw = await this.client.getOrders({ status: 'open' }) as AlpacaOrderRaw[]
+      return raw.map((o) => this.mapOpenOrder(o))
+    } catch (err) {
+      throw BrokerError.from(err)
     }
   }
 
@@ -541,6 +567,8 @@ export class AlpacaBroker implements IBroker {
     if (o.stop_price) order.auxPrice = new Decimal(o.stop_price)
     if (o.time_in_force) order.tif = o.time_in_force.toUpperCase()
     if (o.extended_hours) order.outsideRth = true
+    // Fill data — sync reads these to record execution qty/price into git.
+    if (o.filled_qty != null) order.filledQuantity = new Decimal(o.filled_qty)
     // Alpaca order IDs are UUIDs — IBKR's orderId field is number, so leave at default 0.
     // The real string ID is preserved through PlaceOrderResult.orderId and getOrder(string).
     order.orderId = 0
@@ -550,6 +578,8 @@ export class AlpacaBroker implements IBroker {
       contract,
       order,
       orderState: makeOrderState(o.status, o.reject_reason ?? undefined),
+      ...(o.id && { orderId: o.id }),
+      ...(o.filled_avg_price != null && { avgFillPrice: o.filled_avg_price }),
       ...(tpsl && { tpsl }),
     }
   }

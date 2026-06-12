@@ -1,10 +1,11 @@
 import { z } from 'zod'
-import { readFile, writeFile, mkdir, unlink, rm } from 'fs/promises'
+import { readFile, writeFile, mkdir, unlink, rm, rename, chmod } from 'fs/promises'
 import { resolve, join, dirname } from 'path'
 import { homedir } from 'os'
 import { newsCollectorSchema } from '../domain/news/config.js'
 import { runMigrations } from '../migrations/runner.js'
 import { dataPath } from '@/core/paths.js'
+import { isSealedEnvelope, seal, unseal } from './sealing.js'
 
 const CONFIG_DIR = dataPath('config')
 
@@ -303,6 +304,19 @@ const snapshotSchema = z.object({
   every: z.string().default('15m'),
 })
 
+const tradingSchema = z.object({
+  /**
+   * External-order observation cadence — how often UTA lists the broker's
+   * open orders to catch ones placed outside Alice (exchange app, direct
+   * API). Duration string ('1m' / '5m' / '10m' / '15m'); 'off' disables.
+   * Default 15m: untracked orders are a narrative-fidelity feature, not a
+   * primary flow — keep the standing request rate negligible (96/day per
+   * account). Fill/cancel detection for KNOWN pending orders is separate
+   * (10s fast lane) and unaffected by this knob.
+   */
+  observeExternalOrdersEvery: z.string().default('15m'),
+})
+
 export const toolsSchema = z.object({
   /** Tool names that are disabled. Tools not listed are enabled by default. */
   disabled: z.array(z.string()).default([]),
@@ -403,6 +417,7 @@ export type Config = {
   compaction: z.infer<typeof compactionSchema>
   aiProvider: z.infer<typeof aiProviderSchema>
   snapshot: z.infer<typeof snapshotSchema>
+  trading: z.infer<typeof tradingSchema>
   mcp: z.infer<typeof mcpSchema>
   connectors: z.infer<typeof connectorsSchema>
   news: z.infer<typeof newsCollectorSchema>
@@ -445,7 +460,7 @@ export async function loadConfig(): Promise<Config> {
   // is pending. See src/migrations/INDEX.md for the full list.
   await runMigrations()
 
-  const files = ['engine.json', 'agent.json', 'crypto.json', 'securities.json', 'market-data.json', 'compaction.json', 'ai-provider-manager.json', 'snapshot.json', 'mcp.json', 'connectors.json', 'news.json', 'tools.json', 'webhook.json'] as const
+  const files = ['engine.json', 'agent.json', 'crypto.json', 'securities.json', 'market-data.json', 'compaction.json', 'ai-provider-manager.json', 'snapshot.json', 'mcp.json', 'connectors.json', 'news.json', 'tools.json', 'webhook.json', 'trading.json'] as const
   const raws = await Promise.all(files.map((f) => loadJsonFile(f)))
 
   const config: Config = {
@@ -462,6 +477,7 @@ export async function loadConfig(): Promise<Config> {
     news:          await parseAndSeed(files[10], newsCollectorSchema, raws[10]),
     tools:         await parseAndSeed(files[11], toolsSchema, raws[11]),
     webhook:       await parseAndSeed(files[12], webhookSchema, raws[12]),
+    trading:       await parseAndSeed(files[13], tradingSchema, raws[13]),
   }
 
   // Spawn-time-fixed channel: when guardian (Electron main) spawns the
@@ -599,16 +615,49 @@ function migrateLegacyUTA(raw: Record<string, unknown>): Record<string, unknown>
   return null
 }
 
+/**
+ * Write the accounts file sealed (AES-256-GCM envelope, see sealing.ts) and
+ * owner-only. Every accounts.json write funnels here so no code path can
+ * regress to plaintext credentials at rest.
+ */
+async function writeAccountsFile(validated: UTAConfig[]): Promise<void> {
+  await mkdir(CONFIG_DIR, { recursive: true })
+  const path = resolve(CONFIG_DIR, 'accounts.json')
+  await writeFile(path, JSON.stringify(await seal(validated), null, 2) + '\n', { mode: 0o600 })
+  await chmod(path, 0o600).catch(() => { /* noop — platform without chmod */ })
+}
+
 // File name on disk stays `accounts.json` — internal-only, never
 // user-visible. Renaming would require another migration block; cost
 // outweighs benefit. The on-disk schema is the new UTA shape.
 export async function readUTAsConfig(): Promise<UTAConfig[]> {
-  const raw = await loadJsonFile('accounts.json')
+  let raw = await loadJsonFile('accounts.json')
   if (raw === undefined) {
-    // Seed empty file on first run
-    await mkdir(CONFIG_DIR, { recursive: true })
-    await writeFile(resolve(CONFIG_DIR, 'accounts.json'), '[]\n')
+    // Seed empty (sealed) file on first run — also materializes sealing.key
+    // early, so later credential writes never race key creation.
+    await writeAccountsFile([])
     return []
+  }
+
+  // Sealed envelope — the normal at-rest shape. A plain array is the legacy
+  // plaintext form: still readable (migration 0009 reseals it at boot).
+  if (isSealedEnvelope(raw)) {
+    try {
+      raw = await unseal(raw)
+    } catch (err) {
+      // Recoverable, loudly: quarantine the unreadable file (never delete —
+      // it's the user's broker config, the key may resurface) and continue
+      // with an empty store so the app still boots.
+      const quarantine = resolve(CONFIG_DIR, `accounts.json.sealed-unreadable-${Date.now()}`)
+      await rename(resolve(CONFIG_DIR, 'accounts.json'), quarantine)
+      console.error(
+        `accounts.json could not be unsealed: ${err instanceof Error ? err.message : String(err)}\n` +
+        `The file was preserved at ${quarantine}. Starting with an empty account store — ` +
+        `re-enter broker credentials in Settings → Trading.`,
+      )
+      await writeAccountsFile([])
+      return []
+    }
   }
 
   // Auto-migrate the pre-preset shape ({type, brokerConfig}) into the
@@ -639,7 +688,7 @@ export async function readUTAsConfig(): Promise<UTAConfig[]> {
     )
 
     const validated = utasFileSchema.parse(migrated)
-    await writeFile(resolve(CONFIG_DIR, 'accounts.json'), JSON.stringify(validated, null, 2) + '\n')
+    await writeAccountsFile(validated)
     return validated
   }
 
@@ -648,8 +697,7 @@ export async function readUTAsConfig(): Promise<UTAConfig[]> {
 
 export async function writeUTAsConfig(utas: UTAConfig[]): Promise<void> {
   const validated = utasFileSchema.parse(utas)
-  await mkdir(CONFIG_DIR, { recursive: true })
-  await writeFile(resolve(CONFIG_DIR, 'accounts.json'), JSON.stringify(validated, null, 2) + '\n')
+  await writeAccountsFile(validated)
 }
 
 /**
@@ -660,7 +708,7 @@ export async function writeUTAsConfig(utas: UTAConfig[]): Promise<void> {
  * No-op if the directory doesn't exist; never touches `data/config/`.
  */
 export async function wipeUTATradingData(id: string): Promise<void> {
-  const dir = resolve('data', 'trading', id)
+  const dir = dataPath('trading', id)
   await rm(dir, { recursive: true, force: true })
 }
 
@@ -831,6 +879,7 @@ const sectionSchemas: Record<ConfigSection, z.ZodTypeAny> = {
   compaction: compactionSchema,
   aiProvider: aiProviderSchema,
   snapshot: snapshotSchema,
+  trading: tradingSchema,
   mcp: mcpSchema,
   connectors: connectorsSchema,
   news: newsCollectorSchema,
@@ -847,6 +896,7 @@ const sectionFiles: Record<ConfigSection, string> = {
   compaction: 'compaction.json',
   aiProvider: 'ai-provider-manager.json',
   snapshot: 'snapshot.json',
+  trading: 'trading.json',
   mcp: 'mcp.json',
   connectors: 'connectors.json',
   news: 'news.json',

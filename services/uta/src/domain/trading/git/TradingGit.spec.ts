@@ -688,7 +688,9 @@ describe('TradingGit', () => {
 
       const pending = gitP.getPendingOrderIds()
       expect(pending).toHaveLength(1)
-      expect(pending[0]).toEqual({ orderId: 'lmt-1', symbol: 'AAPL' })
+      // localSymbol/aliceId ride along when the operation's contract has
+      // them — broker lookup hint + reconcile race guard respectively.
+      expect(pending[0]).toMatchObject({ orderId: 'lmt-1', symbol: 'AAPL' })
     })
 
     it('excludes orders that have been synced to filled', async () => {

@@ -71,6 +71,33 @@ export interface CcxtExchangeOverrides {
     exchange: Exchange,
     defaultImpl: DefaultImpl<[Exchange], CcxtPosition[]>,
   ): Promise<CcxtPosition[]>
+
+  /** Place an order WITH attached TP/SL, venue-verified. CcxtBroker
+   *  refuses tpsl placement entirely when an exchange has no such
+   *  override — observed live: ccxt's unified takeProfit/stopLoss params
+   *  were silently dropped on okx spot and the entry filled unprotected.
+   *  Implementations must map to the venue's real attach mechanism (okx:
+   *  attachAlgoOrds; bybit: v5 takeProfit/stopLoss fields) and be verified
+   *  live before registering. */
+  placeOrderWithTpSl?(
+    exchange: Exchange,
+    symbol: string,
+    type: string,
+    side: 'buy' | 'sell',
+    amount: number,
+    price: number | undefined,
+    tpsl: { takeProfit?: { price: string }; stopLoss?: { price: string; limitPrice?: string } },
+    params: Record<string, unknown>,
+  ): Promise<CcxtOrder>
+
+  /** List ALL open orders across every market type the account trades.
+   *  Override when the venue's listing endpoint is category-scoped and the
+   *  unscoped call silently returns a subset (bybit: defaultType 'swap'
+   *  hides spot orders — observed live, no error raised). */
+  fetchAllOpenOrders?(
+    exchange: Exchange,
+    defaultImpl: DefaultImpl<[Exchange], CcxtOrder[]>,
+  ): Promise<CcxtOrder[]>
 }
 
 // ==================== Default implementations ====================
@@ -118,6 +145,18 @@ export async function defaultPlaceOrder(
 /** Default: pass straight through to ccxt.fetchPositions. */
 export async function defaultFetchPositions(exchange: Exchange): Promise<CcxtPosition[]> {
   return await exchange.fetchPositions()
+}
+
+/**
+ * Default: one unscoped fetchOpenOrders call. Verified live on OKX — its
+ * pending-orders endpoint is NOT instType-scoped, so a single call returns
+ * spot + swap together. Do NOT assume that generalizes: ccxt has no
+ * semantics here, it's an SDK over whatever the venue does. Exchanges whose
+ * listing is category-scoped (bybit) get their own override; new exchanges
+ * should be probed live before trusting this default.
+ */
+export async function defaultFetchAllOpenOrders(exchange: Exchange): Promise<CcxtOrder[]> {
+  return await exchange.fetchOpenOrders()
 }
 
 // ==================== Registry ====================

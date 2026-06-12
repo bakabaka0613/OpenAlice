@@ -14,6 +14,8 @@ import { BrokerError, type IBroker, type AccountInfo, type Position, type OpenOr
 const REACH_RANK: Record<UTAReach, number> = { down: 0, connected: 1, readable: 2 }
 import { TradingGit } from './git/TradingGit.js'
 import { recomputeCostBasisFromCommits } from './cost-basis.js'
+import { projectOrderHistory, projectTradeHistory } from './order-history.js'
+import type { OrderHistoryEntry, TradeHistoryEntry } from '@traderalice/uta-protocol'
 import { pnlOf } from './position-math.js'
 import type {
   Operation,
@@ -534,6 +536,23 @@ export class UnifiedTradingAccount {
     return this.git.status()
   }
 
+  /**
+   * Sync cost model — two strategies, picked by broker capability:
+   *
+   * LISTING (broker has getOpenOrders): ONE listing call covers every
+   * pending order. An order still present is alive — zero further calls,
+   * no matter how long it hangs (stop-loss / take-profit orders can sit
+   * for weeks; per-order polling would be 8.6k calls/day EACH). An order
+   * ABSENT from the listing transitioned — only then is getOrder spent to
+   * confirm the terminal state + execution data. Absence alone is never
+   * trusted as terminal: conditional/algo orders on some venues live in a
+   * different listing namespace, so a vanished-but-still-Submitted confirm
+   * is treated as "still working".
+   *
+   * PER-ORDER (no listing capability): poll each pending order with
+   * age-based backoff — fresh orders (likely marketable) every pass, then
+   * 1m, then 5m once they've proven to be hangers.
+   */
   async sync(opts?: { delayMs?: number }): Promise<SyncResult> {
     const pendingOrders = this.git.getPendingOrderIds()
     if (pendingOrders.length === 0) {
@@ -543,10 +562,25 @@ export class UnifiedTradingAccount {
     // Optional delay — gives exchange APIs time to settle before querying
     if (opts?.delayMs) await new Promise(r => setTimeout(r, opts.delayMs))
 
+    let candidates = pendingOrders
+    if (this.broker.getOpenOrders) {
+      const listing = await this._callBroker(() => this.broker.getOpenOrders!())
+      const openIds = new Set(listing.map((o) => o.orderId).filter(Boolean))
+      // Present in the listing → alive, skip. (A just-placed order missing
+      // due to listing lag is also safe: its confirm returns Submitted.)
+      candidates = pendingOrders.filter((p) => !openIds.has(p.orderId))
+    } else {
+      candidates = pendingOrders.filter((p) => this._pollBackoffDue(p.orderId))
+    }
+
+    if (candidates.length === 0) {
+      return { hash: '', updatedCount: 0, updates: [] }
+    }
+
     const updates: OrderStatusUpdate[] = []
 
-    for (const { orderId, symbol } of pendingOrders) {
-      const brokerOrder = await this._callBroker(() => this.broker.getOrder(orderId))
+    for (const { orderId, symbol, localSymbol } of candidates) {
+      const brokerOrder = await this._callBroker(() => this.broker.getOrder(orderId, localSymbol))
       if (!brokerOrder) continue
 
       const status = brokerOrder.orderState.status
@@ -560,11 +594,24 @@ export class UnifiedTradingAccount {
           ? orderFilledQty.toFixed()
           : undefined
 
+        const currentStatus =
+          status === 'Filled' ? 'filled' : status === 'Cancelled' ? 'cancelled' : 'rejected'
+        if (currentStatus === 'filled' && (!filledQty || !brokerOrder.avgFillPrice)) {
+          // Loud, not fatal: a fill without qty/price still advances the
+          // state machine, but cost-basis reconstruction downstream will be
+          // missing data — that must be visible, not silent.
+          console.warn(
+            `UTA[${this.id}]: order ${orderId} (${symbol}) synced to filled but broker omitted ` +
+            `${!filledQty ? 'filledQuantity' : ''}${!filledQty && !brokerOrder.avgFillPrice ? ' and ' : ''}` +
+            `${!brokerOrder.avgFillPrice ? 'avgFillPrice' : ''} — cost basis for this fill may be incomplete`,
+          )
+        }
+
         updates.push({
           orderId,
           symbol,
           previousStatus: 'submitted',
-          currentStatus: status === 'Filled' ? 'filled' : status === 'Cancelled' ? 'cancelled' : 'rejected',
+          currentStatus,
           filledQty,
           filledPrice: brokerOrder.avgFillPrice,
         })
@@ -579,8 +626,70 @@ export class UnifiedTradingAccount {
     return this.git.sync(updates, state)
   }
 
-  getPendingOrderIds(): Array<{ orderId: string; symbol: string }> {
+  getPendingOrderIds(): Array<{ orderId: string; symbol: string; localSymbol?: string }> {
     return this.git.getPendingOrderIds()
+  }
+
+  /** Exchange-frontend projection — same translation the UI and routes use. */
+  async orderHistory(limit = 50): Promise<OrderHistoryEntry[]> {
+    return projectOrderHistory(this.git.exportState().commits, { limit })
+  }
+
+  /** Exchange-frontend projection — fills only. */
+  async tradeHistory(limit = 50): Promise<TradeHistoryEntry[]> {
+    return projectTradeHistory(this.git.exportState().commits, { limit })
+  }
+
+  /** firstSeen/lastPolled per pending order — drives the per-order polling
+   *  backoff for brokers without a listing API. In-memory only: a restart
+   *  resets every order to "fresh", which just means one eager poll. */
+  private _pollState = new Map<string, { firstSeenAt: number; lastPolledAt: number }>()
+
+  private _pollBackoffDue(orderId: string): boolean {
+    const now = Date.now()
+    const state = this._pollState.get(orderId)
+    if (!state) {
+      this._pollState.set(orderId, { firstSeenAt: now, lastPolledAt: now })
+      return true
+    }
+    const age = now - state.firstSeenAt
+    // <2min old: every pass (marketable orders resolve here). <1h: every
+    // 60s. Older: every 5min — it's a hanger (stop/take-profit), awareness
+    // latency of minutes changes nothing about the execution itself.
+    const interval = age < 2 * 60_000 ? 0 : age < 60 * 60_000 ? 60_000 : 5 * 60_000
+    if (now - state.lastPolledAt < interval) return false
+    state.lastPolledAt = now
+    return true
+  }
+
+  /**
+   * Faithful-record pass for orders Alice didn't place: diff the broker's
+   * open orders against every orderId the log has ever seen, and squash the
+   * unknowns into one [observed] commit. The log is the narrative, not the
+   * state engine — this exists so "怎么回事" is always answerable from the
+   * log. Once recorded (orderId + submitted), the regular pending scanner
+   * and sync poller track the order's fill/cancel like any other.
+   *
+   * No-op (0 broker calls beyond the listing) when the broker can't
+   * enumerate open orders or everything is already known.
+   */
+  async observeExternalOrders(): Promise<{ observed: number }> {
+    if (!this.broker.getOpenOrders) return { observed: 0 }
+    const open = await this._callBroker(() => this.broker.getOpenOrders!())
+    if (open.length === 0) return { observed: 0 }
+
+    const known = this.git.getKnownOrderIds()
+    const unknown = open.filter((o) => o.orderId && !known.has(o.orderId))
+    if (unknown.length === 0) return { observed: 0 }
+
+    for (const o of unknown) this.stampAliceId(o.contract)
+    const stateAfter = await this._getState()
+    await this.git.recordObservedOrders({
+      observed: unknown.map((o) => ({ contract: o.contract, order: o.order, orderId: o.orderId! })),
+      stateAfter,
+    })
+    console.warn(`UTA[${this.id}]: recorded ${unknown.length} external order(s) not placed through Alice`)
+    return { observed: unknown.length }
   }
 
   simulatePriceChange(priceChanges: PriceChangeInput[]): Promise<SimulatePriceChangeResult> {
@@ -593,8 +702,37 @@ export class UnifiedTradingAccount {
 
   // ==================== Broker queries (delegation) ====================
 
-  getAccount(): Promise<AccountInfo> {
-    return this._callBroker(() => this.broker.getAccount())
+  /**
+   * Account info with the UTA-layer invariant enforced: account-level
+   * unrealizedPnL ALWAYS equals the sum over reconciled positions. Brokers
+   * can't uphold this themselves — wallet-sourced spot positions (CCXT
+   * synthesis from fetchBalance) carry a placeholder unrealizedPnL of '0'
+   * at the broker layer because cost basis lives in Alice's order log, not
+   * on the exchange. Trusting broker-reported account PnL therefore shows
+   * 0 for spot-only accounts while the positions surface shows real PnL
+   * (the Bybit-demo aggregation bug). Deriving from positions makes the
+   * two surfaces agree by construction, at the cost of one extra broker
+   * round-trip per account read (a 60s-poll path, not a hot path).
+   */
+  async getAccount(): Promise<AccountInfo> {
+    const account = await this._callBroker(() => this.broker.getAccount())
+    const positions = await this.getPositions()
+    // Currency guard: position PnLs can only be summed when they all share
+    // the account's base currency. Mixed-currency books (IBKR holding HKD +
+    // USD lines) would otherwise blind-sum different units — the exact bug
+    // aggregateAccountFromPositions has today. Those accounts keep the
+    // broker-reported value until the currency-aware FX aggregation lands.
+    const summable = positions.every(
+      (p) => (p.currency || account.baseCurrency) === account.baseCurrency,
+    )
+    if (summable) {
+      let unrealized = new Decimal(0)
+      for (const p of positions) {
+        unrealized = unrealized.plus(new Decimal(p.unrealizedPnL || '0'))
+      }
+      account.unrealizedPnL = unrealized.toString()
+    }
+    return account
   }
 
   async getPositions(): Promise<Position[]> {
@@ -615,6 +753,20 @@ export class UnifiedTradingAccount {
     const walletPositions = positions.filter(p => p.avgCostSource === 'wallet')
     if (walletPositions.length === 0) return
 
+    // Race guard (observed live as commit dfb01435): a fill can land on the
+    // exchange between the broker's position read and the poller's sync
+    // pass. The position already shows the new quantity, but the projection
+    // doesn't include the fill yet — naive drift detection would book it as
+    // a reconcileBalance at the OBSERVATION-TIME mark price, polluting cost
+    // basis with the wrong price and double-counting once sync records the
+    // real execution. While an aliceId has in-flight orders, its drift
+    // belongs to sync; reconcile only what no pending order can explain.
+    // True residuals (fee-in-kind dust, external transfers racing an open
+    // order) get reconciled on the next pass after the order settles.
+    const inFlight = new Set(
+      this.git.getPendingOrderIds().map((p) => p.aliceId).filter(Boolean),
+    )
+
     for (const p of walletPositions) {
       const aliceId = p.contract.aliceId
       if (!aliceId) continue
@@ -625,8 +777,11 @@ export class UnifiedTradingAccount {
       const drift = p.quantity.minus(projectedQty)
 
       // Tolerance: dust-level differences (sub-1e-8) come from precision
-      // round-trips, not from real balance changes.
-      if (drift.abs().gt(new Decimal('1e-8'))) {
+      // round-trips, not from real balance changes. The in-flight guard
+      // only suppresses RECORDING — the avgCost/PnL projection below still
+      // applies, so a position with a weeks-long hanging stop order keeps
+      // its real cost basis on screen throughout.
+      if (!inFlight.has(aliceId) && drift.abs().gt(new Decimal('1e-8'))) {
         // Bootstrap price: prefer broker-reported avgCost when non-zero
         // (Mock externalTrade, future CCXT-with-fetchMyTrades, anything
         // that observed a real fill price). Fall back to markPrice only

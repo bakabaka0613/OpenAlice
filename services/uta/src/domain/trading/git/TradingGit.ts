@@ -6,7 +6,7 @@
 
 import { createHash } from 'crypto'
 import Decimal from 'decimal.js'
-import { Order, UNSET_DECIMAL } from '@traderalice/ibkr'
+import { Contract, Order, UNSET_DECIMAL } from '@traderalice/ibkr'
 import { OrderHelper } from '../OrderHelper.js'
 import type { ITradingGit, TradingGitConfig } from './interfaces.js'
 import type {
@@ -256,6 +256,66 @@ export class TradingGit implements ITradingGit {
     return hash
   }
 
+  /**
+   * Record externally-observed open orders as ONE squashed commit — the
+   * "commits without a message" the user made on the exchange directly.
+   * The log is a faithful record, not the source of final state: once an
+   * external order is in the log with orderId + submitted, the regular
+   * pending scanner and sync poller track its fill/cancel like any
+   * Alice-placed order.
+   */
+  async recordObservedOrders(params: {
+    observed: Array<{ contract: Contract; order: Order; orderId: string }>
+    stateAfter: GitState
+  }): Promise<CommitHash> {
+    const { observed, stateAfter } = params
+    const timestamp = new Date().toISOString()
+
+    const operations: Operation[] = observed.map((o) => ({
+      action: 'observeExternalOrder',
+      contract: o.contract,
+      order: o.order,
+    }))
+    const results: OperationResult[] = observed.map((o) => ({
+      action: 'observeExternalOrder',
+      success: true,
+      orderId: o.orderId,
+      status: 'submitted',
+    }))
+
+    const message = `[observed] ${observed.length} external order(s) not placed through Alice`
+    const hash = generateCommitHash({ message, operations, timestamp, parentHash: this.head })
+
+    const commit: GitCommit = {
+      hash,
+      parentHash: this.head,
+      message,
+      operations,
+      results,
+      stateAfter,
+      timestamp,
+      round: this.currentRound,
+    }
+
+    this.commits.push(commit)
+    this.head = hash
+
+    await this.config.onCommit?.(this.exportState())
+
+    return hash
+  }
+
+  /** Every broker orderId the log has ever seen — observation diffs against this. */
+  getKnownOrderIds(): Set<string> {
+    const known = new Set<string>()
+    for (const commit of this.commits) {
+      for (const result of commit.results) {
+        if (result.orderId) known.add(result.orderId)
+      }
+    }
+    return known
+  }
+
   // ==================== git log / show / status ====================
 
   log(options: { limit?: number; symbol?: string } = {}): CommitLogEntry[] {
@@ -350,6 +410,17 @@ export class TradingGit implements ITradingGit {
         return `synced → ${status}${price}${qty}`
       }
 
+      case 'observeExternalOrder': {
+        const side = op.order?.action || 'unknown'
+        const qty = op.order?.totalQuantity
+        const qtyStr = qty && !qty.equals(UNSET_DECIMAL) ? qty.toFixed() : '?'
+        if (result?.status === 'filled') {
+          const price = result.filledPrice ? ` @${result.filledPrice}` : ''
+          return `external ${side} ${qtyStr}${price}`
+        }
+        return `external ${side} ${qtyStr} (${result?.status || 'observed'})`
+      }
+
       case 'reconcileBalance': {
         const delta = new Decimal(op.quantityDelta)
         const direction = delta.gte(0) ? 'observed' : 'released'
@@ -377,7 +448,7 @@ export class TradingGit implements ITradingGit {
   // raw Order instances stay private to staging / push internals, never
   // observed by external callers (UI, MCP, c.json, on-disk commit.json).
   private projectOperation(op: Operation): Operation {
-    if (op.action === 'placeOrder') {
+    if (op.action === 'placeOrder' || op.action === 'observeExternalOrder') {
       return { ...op, order: OrderHelper.toWire(op.order) as unknown as Order }
     }
     if (op.action === 'modifyOrder') {
@@ -418,6 +489,7 @@ export class TradingGit implements ITradingGit {
   private static rehydrateOperation(op: Operation): Operation {
     switch (op.action) {
       case 'placeOrder':
+      case 'observeExternalOrder':
         return {
           ...op,
           order: op.order ? TradingGit.rehydrateOrder(op.order) : op.order,
@@ -494,7 +566,7 @@ export class TradingGit implements ITradingGit {
     const commit: GitCommit = {
       hash,
       parentHash: this.head,
-      message: `[sync] ${updates.length} order(s) updated`,
+      message: `[sync] ${updates.slice(0, 3).map((u) => `${u.symbol} ${u.currentStatus}`).join(', ')}${updates.length > 3 ? ` +${updates.length - 3} more` : ''}`,
       operations: [{ action: 'syncOrders' as const }],
       results: updates.map((u) => ({
         action: 'syncOrders' as const,
@@ -517,7 +589,7 @@ export class TradingGit implements ITradingGit {
     return { hash, updatedCount: updates.length, updates }
   }
 
-  getPendingOrderIds(): Array<{ orderId: string; symbol: string }> {
+  getPendingOrderIds(): Array<{ orderId: string; symbol: string; localSymbol?: string; aliceId?: string }> {
     // Scan newest→oldest to find latest known status per orderId
     const orderStatus = new Map<string, string>()
 
@@ -530,7 +602,7 @@ export class TradingGit implements ITradingGit {
     }
 
     // Collect orders still pending
-    const pending: Array<{ orderId: string; symbol: string }> = []
+    const pending: Array<{ orderId: string; symbol: string; localSymbol?: string; aliceId?: string }> = []
     const seen = new Set<string>()
 
     for (const commit of this.commits) {
@@ -541,8 +613,21 @@ export class TradingGit implements ITradingGit {
           !seen.has(result.orderId) &&
           orderStatus.get(result.orderId) === 'submitted'
         ) {
-          const symbol = getOperationSymbol(commit.operations[j])
-          pending.push({ orderId: result.orderId, symbol })
+          const op = commit.operations[j]
+          const symbol = getOperationSymbol(op)
+          // Broker-native symbol for symbol-scoped order lookups (CCXT).
+          // Persisted with the operation, so it survives process restarts
+          // where the broker's in-memory orderId→symbol cache is empty.
+          const hasContract =
+            op?.action === 'placeOrder' || op?.action === 'closePosition' || op?.action === 'observeExternalOrder'
+          const localSymbol = hasContract ? op.contract?.localSymbol || undefined : undefined
+          const aliceId = hasContract ? op.contract?.aliceId || undefined : undefined
+          pending.push({
+            orderId: result.orderId,
+            symbol,
+            ...(localSymbol && { localSymbol }),
+            ...(aliceId && { aliceId }),
+          })
           seen.add(result.orderId)
         }
       }
