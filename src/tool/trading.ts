@@ -9,13 +9,13 @@
 import { tool, type Tool } from 'ai'
 import { z } from 'zod'
 import Decimal from 'decimal.js'
-import { Contract, UNSET_DECIMAL, coerceSecType } from '@traderalice/ibkr'
+import { Contract, coerceSecType } from '@traderalice/ibkr'
 import { BrokerError, type OpenOrder } from '@traderalice/uta-protocol'
 import type { UTAManagerSDK } from '@/services/uta-client/index.js'
 import { normalizeBrokerSearchPattern } from '@traderalice/uta-protocol'
 import {
   compactAccountInfo, compactCommit, compactContract, compactContractDetails,
-  compactOperation, compactPushResult, compactStageResult, compactStatus,
+  compactOperation, compactOrderFields, compactPushResult, compactStageResult, compactStatus,
   money, price,
 } from './trading-compact.js'
 // `Contract.aliceId` declaration merge is registered as a side-effect
@@ -44,27 +44,25 @@ function handleBrokerError(err: unknown): { error: string; code: string; transie
   }
 }
 
-/** Summarize an OpenOrder into a compact object for AI consumption. */
+/**
+ * Summarize an OpenOrder for AI consumption. Uses the value-tolerant
+ * compactors (NOT order.field.equals(...)) because over HTTP the Order's
+ * Decimal fields arrive as strings — calling Decimal methods on them threw
+ * "totalQuantity.equals is not a function" and broke getOrders entirely.
+ * Order id comes from the top-level string field: the inner `order.orderId`
+ * is the IBKR number form and float-truncates 19-digit CCXT ids (…344→…300).
+ */
 function summarizeOrder(o: OpenOrder, source: string, stringOrderId?: string) {
-  const order = o.order
+  const order = o.order as unknown as Record<string, unknown>
+  const innerId = order['orderId']
   return {
     source,
-    orderId: stringOrderId ?? String(order.orderId),
+    orderId: stringOrderId ?? o.orderId ?? (innerId != null ? String(innerId) : ''),
     aliceId: o.contract.aliceId ?? '',
     symbol: o.contract.symbol || o.contract.localSymbol || '',
-    action: order.action,
-    orderType: order.orderType,
-    totalQuantity: order.totalQuantity.equals(UNSET_DECIMAL) ? '0' : order.totalQuantity.toFixed(),
     status: o.orderState.status,
-    ...(!order.lmtPrice.equals(UNSET_DECIMAL) && { lmtPrice: order.lmtPrice.toFixed() }),
-    ...(!order.auxPrice.equals(UNSET_DECIMAL) && { auxPrice: order.auxPrice.toFixed() }),
-    ...(!order.trailStopPrice.equals(UNSET_DECIMAL) && { trailStopPrice: order.trailStopPrice.toFixed() }),
-    ...(!order.trailingPercent.equals(UNSET_DECIMAL) && { trailingPercent: order.trailingPercent.toFixed() }),
-    ...(order.tif && { tif: order.tif }),
-    ...(!order.filledQuantity.equals(UNSET_DECIMAL) && { filledQuantity: order.filledQuantity.toString() }),
-    ...(o.avgFillPrice != null && { avgFillPrice: o.avgFillPrice }),
-    ...(order.parentId !== 0 && { parentId: order.parentId }),
-    ...(order.ocaGroup && { ocaGroup: order.ocaGroup }),
+    ...compactOrderFields(order),
+    ...(o.avgFillPrice != null && { avgFillPrice: price(o.avgFillPrice) }),
     ...(o.tpsl && { tpsl: o.tpsl }),
   }
 }
@@ -160,6 +158,12 @@ export function createTradingTools(manager: UTAManagerSDK): Record<string, Tool>
       description: `Search broker accounts for tradeable contracts matching a pattern.
 This is a BROKER-LEVEL search — it queries your connected trading accounts.
 
+Results are either LEAVES (tradeable, use aliceId with getQuote/placeOrder) or
+DIRECTORIES (expandable: true — e.g. a bond issuer): call expandContract on
+those to list the tradeable contracts inside. Stock rows with
+derivativeSecTypes (OPT/FUT…) can also be expanded into their option chain /
+futures months via expandContract.
+
 Pass \`assetClass\` when known (especially "crypto" or "currency") so the
 data-vendor symbol is normalized into a broker-friendly pattern — e.g. a
 search for "BTCUSD" with assetClass="crypto" is rewritten to "BTC" before
@@ -185,7 +189,14 @@ hitting the broker, which otherwise expects the bare base ticker.`,
         )
         for (const r of settled) {
           if (r.status !== 'fulfilled') continue
-          for (const desc of r.value.results) all.push({ source: r.value.id, ...desc, contract: compactContract((desc as { contract?: unknown }).contract) })
+          for (const desc of r.value.results) {
+            const contract = compactContract((desc as { contract?: unknown }).contract)
+            // Directory rows (bond issuers, …) are addressable but NOT
+            // tradeable — flag them so the agent reaches for expandContract
+            // instead of placeOrder.
+            const expandable = typeof contract['aliceId'] === 'string' && (contract['aliceId'] as string).includes('|issuer:')
+            all.push({ source: r.value.id, ...desc, contract, ...(expandable ? { expandable: true } : {}) })
+          }
         }
         if (all.length === 0) return { results: [], message: `No contracts found matching "${brokerPattern}" (input: "${pattern}").` }
         return all
@@ -296,7 +307,13 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
               const percentOfEquity = netLiqUsd.gt(0) ? mvUsd.div(netLiqUsd).mul(100) : new Decimal(0)
               const percentOfPortfolio = totalMarketValueUsd.gt(0) ? mvUsd.div(totalMarketValueUsd).mul(100) : new Decimal(0)
               allPositions.push({
-                source: uta.id, symbol: pos.contract.symbol, currency: pos.currency, side: pos.side,
+                source: uta.id, symbol: pos.contract.symbol,
+                // secType + aliceId disambiguate same-symbol positions (ETH
+                // spot vs ETH perp render identically without them) and give
+                // the agent the exact id closePosition needs.
+                secType: pos.contract.secType,
+                aliceId: pos.contract.aliceId,
+                currency: pos.currency, side: pos.side,
                 quantity: pos.quantity.toString(), avgCost: price(pos.avgCost), marketPrice: price(pos.marketPrice),
                 marketValue: money(pos.marketValue), unrealizedPnL: money(pos.unrealizedPnL), realizedPnL: money(pos.realizedPnL),
                 percentageOfEquity: `${percentOfEquity.toFixed(1)}%`,
@@ -378,6 +395,59 @@ If this tool returns an error with transient=true, wait a few seconds and retry 
           const contract = Object.assign(new Contract(), { aliceId })
           const quote = await uta.getQuote(contract)
           return { source: uta.id, ...quote, contract: compactContract(quote.contract) }
+        } catch (err) {
+          return handleBrokerError(err)
+        }
+      },
+    }),
+
+    expandContract: tool({
+      description: `Expand a directory-style contract into tradeable leaves.
+Venue search returns two species: LEAVES (tradeable, with conId-style aliceId) and HUBS (directories).
+- Bond issuer hub (aliceId like "ibkr-x|issuer:e1400789"): expands to the issuer's individual bonds.
+- Stock underlying (numeric aliceId): no expiry → option-chain parameter grid (expirations × strikes); with expiry → concrete option contracts for that expiry.
+- secType=FUT on an underlying: futures contract months.
+Every returned leaf carries its own aliceId usable with getQuote / placeOrder.`,
+      inputSchema: z.object({
+        aliceId: z.string().describe('Hub or underlying contract ID (format: accountId|nativeKey, from searchContracts)'),
+        expiry: z.string().optional().describe('Expiry YYYYMMDD or YYYYMM — switches option expansion from the grid to concrete contracts'),
+        right: z.enum(['C', 'P']).optional().describe('Option right filter'),
+        strikeMin: z.number().optional().describe('Lowest strike to include'),
+        strikeMax: z.number().optional().describe('Highest strike to include'),
+        secType: z.enum(['OPT', 'FUT']).optional().describe('Derivative family to expand on an underlying (default OPT)'),
+        limit: z.number().int().positive().optional().describe('Max leaves returned (default 60). total always reports the full count.'),
+      }).meta({ examples: [
+        { aliceId: 'ibkr-tws|265598' },
+        { aliceId: 'ibkr-tws|265598', expiry: '20260717', right: 'C', strikeMin: 280, strikeMax: 310 },
+        { aliceId: 'ibkr-tws|issuer:e1400789' },
+      ] }),
+      execute: async ({ aliceId, ...filters }) => {
+        const parsed = parseAliceId(aliceId)
+        if (!parsed) {
+          return { error: `Invalid aliceId "${aliceId}". Expected format: "accountId|nativeKey".` }
+        }
+        try {
+          const uta = await manager.resolveOne(parsed.utaId)
+          const result = await uta.expandContract(aliceId, filters)
+          if (result.kind === 'contracts') {
+            return {
+              source: uta.id,
+              total: result.total,
+              contracts: (result.contracts ?? []).map(compactContract),
+              ...(result.hint ? { hint: result.hint } : {}),
+            }
+          }
+          return {
+            source: uta.id,
+            grid: (result.grid ?? []).map((g) => ({
+              exchange: g.exchange,
+              tradingClass: g.tradingClass,
+              multiplier: g.multiplier,
+              expirations: g.expirations,
+              strikes: g.strikes,
+            })),
+            ...(result.hint ? { hint: result.hint } : {}),
+          }
         } catch (err) {
           return handleBrokerError(err)
         }
