@@ -83,11 +83,20 @@ export const claudeAdapter: CliAdapter = {
   // progress in the task log AND every event carries `session_id`, so the
   // run's identity is captured from line 1 instead of parsed out of a final
   // result blob (verified 2.1.x, 2026-06-11).
+  //
+  // `--dangerously-skip-permissions` is REQUIRED: in `-p` mode there is no
+  // human to grant per-tool approval, so without it EVERY tool call (Bash,
+  // Write, every MCP tool including inbox_push) is denied — the agent runs,
+  // emits a text-only "I need permission" turn, and delivers nothing. This is
+  // the claude analog of codex's `approval_policy="never"`; the workspace is
+  // the sandbox boundary (see Key Architecture › Workspaces). Place it before
+  // the `--` terminator.
   composeHeadlessCommand(base: readonly string[], _ctx: SpawnContext, prompt: string): readonly string[] {
     return [
       ...base,
       '--settings', AUTOTRUST_SETTINGS,
       '-p', '--output-format', 'stream-json', '--verbose',
+      '--dangerously-skip-permissions',
       '--', prompt,
     ];
   },

@@ -293,10 +293,12 @@ describe('composeHeadlessCommand (one-shot headless argv, prompt placed per-CLI)
     expect(piAdapter.capabilities.headless).toBe(true);
   });
 
-  it('claude: -p stream-json --verbose -- <prompt> (prompt after -- terminator, never --bare)', () => {
+  it('claude: -p stream-json --verbose --dangerously-skip-permissions -- <prompt> (session-id capture + headless must bypass per-tool approval, prompt after -- terminator, never --bare)', () => {
     // stream-json REQUIRES --verbose in -p mode (claude errors without it);
     // every event carries session_id, which is how the launcher captures the
-    // run's identity for "open as session".
+    // run's identity for "open as session". --dangerously-skip-permissions is
+    // required too: in -p mode there's no human to grant per-tool approval, so
+    // without it every tool call (incl. inbox_push) is denied.
     expect(claudeAdapter.composeHeadlessCommand!(['claude'], ctx(), 'do x')).toEqual([
       'claude',
       '--settings',
@@ -305,6 +307,7 @@ describe('composeHeadlessCommand (one-shot headless argv, prompt placed per-CLI)
       '--output-format',
       'stream-json',
       '--verbose',
+      '--dangerously-skip-permissions',
       '--',
       'do x',
     ]);
