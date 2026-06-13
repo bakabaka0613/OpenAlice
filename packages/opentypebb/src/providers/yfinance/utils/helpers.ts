@@ -205,6 +205,56 @@ function endDateToPeriod2(endDate: string): Date {
   return d
 }
 
+interface ChartQuote {
+  date: Date | string | number
+  open?: number | null
+  high?: number | null
+  low?: number | null
+  close?: number | null
+  volume?: number | null
+  adjclose?: number | null
+}
+
+const isFiniteNum = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n)
+
+/**
+ * Map Yahoo chart quotes into OHLCV records, dropping incomplete bars.
+ *
+ * Yahoo emits placeholder bars for no-trade days and the current in-progress
+ * session — typically a valid `open` with null `high/low/close`, or all-null
+ * (seen on thin TWSE names like 1101.TW). Leaking those nulls downstream breaks
+ * consumers — lightweight-charts asserts every OHLC value is a finite number
+ * and throws synchronously, which (absent a UI error boundary) blanked the whole
+ * app. So any bar that isn't a complete, positive-open OHLC quote is dropped at
+ * the source rather than emitted with null fields.
+ */
+export function quotesToHistoricalRecords(
+  quotes: ChartQuote[],
+  isIntraday: boolean,
+): Record<string, unknown>[] {
+  const records: Record<string, unknown>[] = []
+  for (const q of quotes) {
+    if (!isFiniteNum(q.open) || q.open <= 0) continue
+    if (!isFiniteNum(q.high) || !isFiniteNum(q.low) || !isFiniteNum(q.close)) continue
+
+    const date = q.date instanceof Date ? q.date : new Date(q.date as any)
+    const dateStr = isIntraday
+      ? date.toISOString().replace('T', ' ').slice(0, 19)
+      : date.toISOString().slice(0, 10)
+
+    records.push({
+      date: dateStr,
+      open: q.open,
+      high: q.high,
+      low: q.low,
+      close: q.close,
+      volume: q.volume ?? null,
+      ...(q.adjclose != null ? { adj_close: q.adjclose } : {}),
+    })
+  }
+  return records
+}
+
 /**
  * Fetch historical chart data from Yahoo Finance.
  * Uses yahoo-finance2's chart method which handles authentication.
@@ -241,25 +291,7 @@ export async function getHistoricalData(
 
   const isIntraday = ['1m', '2m', '5m', '15m', '30m', '60m', '90m', '1h'].includes(interval)
 
-  const records: Record<string, unknown>[] = []
-  for (const q of chartResult.quotes) {
-    if (q.open == null || q.open <= 0) continue
-
-    const date = q.date instanceof Date ? q.date : new Date(q.date as any)
-    const dateStr = isIntraday
-      ? date.toISOString().replace('T', ' ').slice(0, 19)
-      : date.toISOString().slice(0, 10)
-
-    records.push({
-      date: dateStr,
-      open: q.open ?? null,
-      high: q.high ?? null,
-      low: q.low ?? null,
-      close: q.close ?? null,
-      volume: q.volume ?? null,
-      ...(q.adjclose != null ? { adj_close: q.adjclose } : {}),
-    })
-  }
+  const records = quotesToHistoricalRecords(chartResult.quotes as ChartQuote[], isIntraday)
 
   if (records.length === 0) {
     throw new EmptyDataError(`No valid historical data for ${symbol}`)

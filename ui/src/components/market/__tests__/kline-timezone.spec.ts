@@ -12,7 +12,8 @@
 process.env.TZ = 'Asia/Taipei'
 
 import { describe, it, expect } from 'vitest'
-import { toUTCTimestamp, formatBarDate } from '../KlinePanel'
+import { toUTCTimestamp, formatBarDate, barsToSeriesData, barsSourceRef } from '../KlinePanel'
+import type { HistoricalBar } from '../../../api/market'
 
 describe('toUTCTimestamp', () => {
   it('shifts an intraday bar into local wall-clock time (+8 in Taipei)', () => {
@@ -40,5 +41,60 @@ describe('formatBarDate', () => {
 
   it('leaves a daily bar (plain date) untouched', () => {
     expect(formatBarDate('2026-06-08')).toBe('2026-06-08')
+  })
+})
+
+describe('barsSourceRef', () => {
+  // Regression: opening a chart from the sidebar/search carries ?source=<barId>,
+  // so a barId is sent. A vendor barId ("yfinance|1101.TW") needs an assetClass
+  // to route to the right client — the backend rejects a bare barId with
+  // "needs an assetClass to route". So assetClass must ride along even when a
+  // barId is the source. (bug: chart showed the route error for 1101.TW.)
+  const selection = { symbol: '1101.TW', assetClass: 'equity' as const }
+
+  it('keeps assetClass when an explicit barId source is picked', () => {
+    expect(barsSourceRef(selection, 'yfinance|1101.TW')).toEqual({
+      barId: 'yfinance|1101.TW',
+      assetClass: 'equity',
+    })
+  })
+
+  it('falls back to symbol + assetClass when no source is picked', () => {
+    expect(barsSourceRef(selection, null)).toEqual({
+      symbol: '1101.TW',
+      assetClass: 'equity',
+    })
+  })
+})
+
+describe('barsToSeriesData', () => {
+  // Regression: lightweight-charts throws "close must be a number, got=object,
+  // value=null" from setData on a null-OHLC bar; with no ErrorBoundary above
+  // KlinePanel that blanked the whole app (1101.TW had a null-close bar).
+  const bar = (over: Partial<HistoricalBar>): HistoricalBar =>
+    ({ date: '2026-06-06', open: 10, high: 11, low: 9, close: 10.5, volume: 100, ...over })
+
+  it('drops bars whose OHLC contains null so setData never asserts', () => {
+    const bars = [
+      bar({ date: '2026-06-05' }),
+      bar({ date: '2026-06-06', close: null as unknown as number }), // in-progress / no-trade day
+    ]
+    const { candleData, volumeData } = barsToSeriesData(bars)
+    expect(candleData).toHaveLength(1)
+    expect(volumeData).toHaveLength(1)
+    expect(candleData.every((c) => typeof c.close === 'number')).toBe(true)
+  })
+
+  it('keeps candle and volume arrays index-aligned after filtering', () => {
+    const bars = [
+      bar({ date: '2026-06-05' }),
+      bar({ date: '2026-06-06', high: null as unknown as number }),
+      bar({ date: '2026-06-07', volume: null }), // null volume is fine → defaults to 0
+    ]
+    const { candleData, volumeData } = barsToSeriesData(bars)
+    expect(candleData).toHaveLength(2)
+    expect(volumeData).toHaveLength(2)
+    expect(candleData.map((c) => c.time)).toEqual(volumeData.map((v) => v.time))
+    expect(volumeData.find((v) => v.time === toUTCTimestamp('2026-06-07'))?.value).toBe(0)
   })
 })

@@ -77,6 +77,46 @@ export function formatBarDate(s: string): string {
   return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())} ${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`
 }
 
+const isFiniteNumber = (n: unknown): n is number => typeof n === 'number' && Number.isFinite(n)
+
+// Convert backend bars into lightweight-charts candle + volume series.
+//
+// lightweight-charts asserts every OHLC value is a finite number and throws
+// synchronously from `setData` otherwise. Providers legitimately emit bars with
+// null OHLC — an in-progress session's current day, or a no-trade day on a thin
+// TWSE/TPEx name. That assertion fires inside our render-commit effect, and with
+// no ErrorBoundary above this panel it unmounts the entire app to a blank page
+// (see #black-screen). So drop the unplottable bars here. Candle and volume are
+// pushed together so the two series stay index-aligned after filtering.
+export function barsToSeriesData(
+  bars: HistoricalBar[],
+): { candleData: CandlestickData[]; volumeData: HistogramData[] } {
+  const candleData: CandlestickData[] = []
+  const volumeData: HistogramData[] = []
+  for (const b of bars) {
+    if (typeof b.date !== 'string') continue
+    if (!isFiniteNumber(b.open) || !isFiniteNumber(b.high) || !isFiniteNumber(b.low) || !isFiniteNumber(b.close)) continue
+    const time = toUTCTimestamp(b.date)
+    candleData.push({ time, open: b.open, high: b.high, low: b.low, close: b.close })
+    volumeData.push({ time, value: b.volume ?? 0, color: b.close >= b.open ? '#3fb95055' : '#f8514955' })
+  }
+  return { candleData, volumeData }
+}
+
+// Build the bars-request source ref. assetClass ALWAYS rides along: the backend
+// needs it to route a vendor barId to the right client and rejects a bare barId
+// ("needs an assetClass to route"). When the chart is opened from the
+// sidebar/search a barId is the source (?source=<barId>); otherwise it's the
+// vendor default keyed by symbol + assetClass.
+export function barsSourceRef(
+  selection: { symbol: string; assetClass: AssetClass },
+  selectedBarId: string | null,
+): { barId: string; assetClass: AssetClass } | { symbol: string; assetClass: AssetClass } {
+  return selectedBarId
+    ? { barId: selectedBarId, assetClass: selection.assetClass }
+    : { symbol: selection.symbol, assetClass: selection.assetClass }
+}
+
 interface Props {
   selection: { symbol: string; assetClass: AssetClass } | null
 }
@@ -200,9 +240,7 @@ export function KlinePanel({ selection }: Props) {
       if (isInitial) setLoading(true)
       setError(null)
       const days = daysForTimeframe(tf)
-      const params: Parameters<typeof barsApi.bars>[0] = { interval }
-      if (selectedBarId) params.barId = selectedBarId
-      else { params.symbol = selection.symbol; params.assetClass = selection.assetClass }
+      const params: Parameters<typeof barsApi.bars>[0] = { interval, ...barsSourceRef(selection, selectedBarId) }
       if (days != null) params.start = startDateFromToday(days)
 
       barsApi.bars(params)
@@ -239,18 +277,7 @@ export function KlinePanel({ selection }: Props) {
       return
     }
 
-    const candleData: CandlestickData[] = bars.map((b) => ({
-      time: toUTCTimestamp(b.date),
-      open: b.open,
-      high: b.high,
-      low: b.low,
-      close: b.close,
-    }))
-    const volumeData: HistogramData[] = bars.map((b) => ({
-      time: toUTCTimestamp(b.date),
-      value: b.volume ?? 0,
-      color: b.close >= b.open ? '#3fb95055' : '#f8514955',
-    }))
+    const { candleData, volumeData } = barsToSeriesData(bars)
 
     candleRef.current.setData(candleData)
     volumeRef.current.setData(volumeData)

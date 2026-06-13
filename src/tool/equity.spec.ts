@@ -23,11 +23,18 @@ function makeMockEquityClient(): EquityClientLike {
     getFinancialRatios: vi.fn(async () => []),
     getEstimateConsensus: vi.fn(async () => []),
     getCalendarEarnings: vi.fn(async () => []),
+    getCalendarIpo: vi.fn(async () => []),
+    getCalendarDividend: vi.fn(async () => []),
     getInsiderTrading: vi.fn(async () => []),
+    getShareStatistics: vi.fn(async () => []),
     getDividends: vi.fn(async () => []),
     getGainers: vi.fn(async () => []),
     getLosers: vi.fn(async () => []),
     getActive: vi.fn(async () => []),
+    getUndervaluedGrowth: vi.fn(async () => []),
+    getGrowthTech: vi.fn(async () => []),
+    getAggressiveSmallCaps: vi.fn(async () => []),
+    getUndervaluedLargeCaps: vi.fn(async () => []),
   }
 }
 

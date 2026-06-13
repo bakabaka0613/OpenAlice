@@ -16,6 +16,26 @@
 
 import type { Hono } from 'hono'
 import type { QueryExecutor } from '../provider/query-executor.js'
+import { EmptyDataError, NetworkUnreachableError, OpenBBError } from '../provider/utils/errors.js'
+
+/**
+ * Map a thrown provider error to an HTTP status. A provider that doesn't
+ * implement a requested model (e.g. yfinance has no FinancialRatios), a missing
+ * credential, or an empty result are capability/client conditions — not server
+ * faults — so they must not surface as 500. A 500 reads as "the backend is
+ * broken" and logs a red error in the browser console; these get honest 4xx/5xx
+ * codes instead. Genuinely unexpected failures still fall through to 500.
+ */
+export function statusForError(error: unknown): 400 | 404 | 501 | 502 | 500 {
+  if (error instanceof EmptyDataError) return 404
+  if (error instanceof NetworkUnreachableError) return 502
+  if (error instanceof OpenBBError) {
+    if (error.message.startsWith('Fetcher not found')) return 501
+    if (error.message.startsWith('Missing credential')) return 400
+    if (error.message.includes('not found in the registry')) return 400
+  }
+  return 500
+}
 
 /**
  * Coerce a URL query-string value to an appropriate JS type.
@@ -225,7 +245,7 @@ export class Router {
             chart: null,
             extra: {},
             error: message,
-          }, 500)
+          }, statusForError(error))
         }
       })
     }

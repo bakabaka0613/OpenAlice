@@ -22,7 +22,7 @@ vi.mock('yahoo-finance2', () => ({
   },
 }))
 
-import { getHistoricalData } from '../helpers.js'
+import { getHistoricalData, quotesToHistoricalRecords } from '../helpers.js'
 
 // Daily bars are timestamped during the trading session (here ~13:30 UTC,
 // US RTH open), i.e. strictly after the day's 00:00 UTC midnight.
@@ -63,5 +63,38 @@ describe('getHistoricalData date-range boundary', () => {
 
     const dates = records.map((r) => r.date)
     expect(dates).not.toContain('2026-06-09')
+  })
+})
+
+describe('quotesToHistoricalRecords', () => {
+  // Regression: Yahoo returns placeholder bars (no-trade day / in-progress
+  // session) with null high/low/close. Leaking them made lightweight-charts
+  // assert "close must be a number, got=object, value=null" and blanked the UI.
+  it('drops bars whose high/low/close is null', () => {
+    const quotes = [
+      { date: new Date('2026-06-05T00:00:00Z'), open: 10, high: 11, low: 9, close: 10.5, volume: 100 },
+      { date: new Date('2026-06-08T00:00:00Z'), open: 10, high: null, low: null, close: null, volume: 0 },
+    ]
+    const records = quotesToHistoricalRecords(quotes, false)
+    expect(records).toHaveLength(1)
+    expect(records[0].date).toBe('2026-06-05')
+    expect(records.every((r) => typeof r.high === 'number' && typeof r.low === 'number' && typeof r.close === 'number')).toBe(true)
+  })
+
+  it('drops bars with non-positive or missing open (existing guard preserved)', () => {
+    const quotes = [
+      { date: new Date('2026-06-05T00:00:00Z'), open: 0, high: 1, low: 1, close: 1, volume: 1 },
+      { date: new Date('2026-06-06T00:00:00Z'), open: null, high: 1, low: 1, close: 1, volume: 1 },
+    ]
+    expect(quotesToHistoricalRecords(quotes, false)).toHaveLength(0)
+  })
+
+  it('keeps a complete bar when only volume is null', () => {
+    const quotes = [
+      { date: new Date('2026-06-05T00:00:00Z'), open: 10, high: 11, low: 9, close: 10.5, volume: null },
+    ]
+    const records = quotesToHistoricalRecords(quotes, false)
+    expect(records).toHaveLength(1)
+    expect(records[0].volume).toBeNull()
   })
 })
